@@ -15,6 +15,7 @@ from playwright.sync_api import sync_playwright
 SERVER_URL = os.getenv("SERVER_URL", "").strip()
 HOSTSHIP_LOGIN = os.getenv("HOSTSHIP_LOGIN", "").strip()
 HOSTSHIP_PASSWORD = os.getenv("HOSTSHIP_PASSWORD", "").strip()
+HOSTSHIP_COOKIE = os.getenv("HOSTSHIP_COOKIE", "").strip()
 
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
@@ -248,6 +249,50 @@ def build_error_message(title, reason, ip):
     )
 
 
+def inject_cookies(context, cookie_str):
+    cookies = []
+
+    for item in cookie_str.split(";"):
+        item = item.strip()
+
+        if "=" in item:
+            name, value = item.split("=", 1)
+
+            cookies.append({
+                "name": name.strip(),
+                "value": value.strip(),
+                "domain": "panel.host-ship.com",
+                "path": "/",
+            })
+
+    if cookies:
+        context.add_cookies(cookies)
+
+    return len(cookies)
+
+
+def try_click_turnstile(page):
+    try:
+        for frame in page.frames:
+            if "challenges.cloudflare.com" in (frame.url or ""):
+                box = frame.locator("input[type='checkbox']")
+
+                if box.count():
+                    box.first.click(timeout=2000)
+
+                    return
+
+                frame.locator("body").click(
+                    position={"x": 28, "y": 28},
+                    timeout=2000,
+                )
+
+                return
+
+    except Exception:
+        pass
+
+
 def first_visible(page, selectors):
     for selector in selectors:
         locator = page.locator(
@@ -341,13 +386,62 @@ def login_if_needed(page):
         log("❌ 没找到登录按钮")
         return False
 
+    try:
+        disabled = submit.is_disabled()
+
+    except Exception:
+        disabled = False
+
+    if disabled:
+        label = ""
+
+        try:
+            label = submit.inner_text().strip()
+
+        except Exception:
+            pass
+
+        log(
+            "⚠️ 提交按钮不可点击（"
+            f"{label or 'disabled'}），"
+            "等待安全验证自动完成..."
+        )
+
+        deadline = time.time() + 60
+        tick = 0
+
+        while time.time() < deadline:
+            time.sleep(2)
+            tick += 1
+
+            if tick % 2 == 0:
+                try_click_turnstile(page)
+
+            try:
+                if submit.is_enabled():
+                    break
+
+            except Exception:
+                pass
+
+        try:
+            if submit.is_disabled():
+                page.screenshot(
+                    path="hostship_security_check.png",
+                    full_page=True,
+                )
+
+                log(
+                    "❌ 安全验证未自动通过，"
+                    "已尝试点击 Turnstile 但验证未完成"
+                )
+
+                return False
+
+        except Exception:
+            return False
+
     submit.click()
-
-    page.wait_for_timeout(3000)
-
-    text = page.locator(
-        "body"
-    ).inner_text().lower()
 
     challenge_words = [
         "captcha",
@@ -356,13 +450,36 @@ def login_if_needed(page):
         "cloudflare",
     ]
 
+    text = ""
+
+    for attempt in range(15):
+        page.wait_for_timeout(2000)
+
+        try_click_turnstile(page)
+
+        text = page.locator(
+            "body"
+        ).inner_text().lower()
+
+        if not any(
+            word in text
+            for word in challenge_words
+        ):
+            break
+
+        if attempt == 0:
+            log(
+                "⚠️ 提交后检测到安全验证，"
+                "正在尝试点击 Turnstile..."
+            )
+
     if any(
         word in text
         for word in challenge_words
     ):
         log(
-            "⚠️ 检测到验证码/"
-            "安全验证，需要手动处理"
+            "⚠️ 安全验证未通过，"
+            "已尝试点击 Turnstile 但验证未完成"
         )
         return False
 
@@ -386,6 +503,7 @@ def get_renewal_text(page):
         r"Renewal\s+in\s+\d+\s+Days?",
         r"Renew\s+in\s+\d+\s+Days?",
         r"\d+\s+Days?\s+until\s+renewal",
+        r"EXPIRES[^\n]*\n+\s*\d+\s+Days?",
     ]
 
     for pattern in patterns:
@@ -450,23 +568,65 @@ def find_renew_button(page):
 
 def confirm_renewal(page):
     """Wait for the renewal dialog and click the real submit button."""
-    title = page.get_by_text(
-        re.compile(
-            r"Confirm\s+server\s+renewal",
-            re.I,
-        )
-    ).first
+    title_patterns = [
+        re.compile(r"Confirm\s+server\s+renewal", re.I),
+        re.compile(r"Confirm\s+renewal", re.I),
+        re.compile(r"Renew\s+server", re.I),
+        re.compile(r"Confirm", re.I),
+    ]
 
-    try:
-        title.wait_for(
-            state="visible",
-            timeout=8000,
-        )
-    except Exception:
+    title = None
+
+    for pattern in title_patterns:
+        candidate = page.get_by_text(pattern).first
+
+        try:
+            candidate.wait_for(
+                state="visible",
+                timeout=4000,
+            )
+
+            title = candidate
+
+            break
+
+        except Exception:
+            continue
+
+    if title is None:
         log("❌ 点击 Renew 后未出现续期确认弹窗")
+
+        try:
+            body_snippet = page.locator(
+                "body"
+            ).inner_text()[:500]
+
+            log(f"📋 页面文本片段：{body_snippet}")
+        except Exception:
+            pass
+
         return False
 
     confirm_buttons = [
+        page.get_by_role(
+            "dialog"
+        ).last.get_by_role(
+            "button",
+            name=re.compile(
+                r"Add\s+\d+\s+days?",
+                re.I,
+            ),
+        ),
+        page.get_by_role(
+            "button",
+            name=re.compile(
+                r"Add\s+\d+\s+days?",
+                re.I,
+            ),
+        ),
+        page.locator(
+            'button:has-text("Add")'
+        ),
         page.get_by_role(
             "dialog"
         ).last.get_by_role(
@@ -486,6 +646,16 @@ def confirm_renewal(page):
         page.locator(
             'button:has-text("Renew now")'
         ),
+        page.get_by_role(
+            "button",
+            name=re.compile(
+                r"renew",
+                re.I,
+            ),
+        ),
+        page.locator(
+            'button:has-text("Renew")'
+        ),
     ]
 
     for group in confirm_buttons:
@@ -501,9 +671,12 @@ def confirm_renewal(page):
                 ):
                     log(
                         "✅ 确认弹窗已打开，"
-                        "点击 Renew now..."
+                        "点击确认按钮..."
                     )
-                    button.click()
+                    button.click(
+                        force=True,
+                        timeout=5000,
+                    )
                     return True
 
         except Exception:
@@ -520,6 +693,9 @@ def renewal_succeeded(before, after, body_text):
         "renewal successful",
         "successfully renewed",
         "renew limit reached",
+        "has been renewed",
+        "server renewed",
+        "renewed",
     ]
 
     if any(word in text for word in success_words):
@@ -537,9 +713,11 @@ def renewal_succeeded(before, after, body_text):
 
 def wait_for_renewal_result(page, before):
     """Poll once, then reload to avoid reading a stale SPA state."""
+    page.wait_for_timeout(3000)
+
     after = get_renewal_text(page)
 
-    for attempt in range(5):
+    for attempt in range(8):
         body_text = page.locator(
             "body"
         ).inner_text()
@@ -554,12 +732,24 @@ def wait_for_renewal_result(page, before):
 
         page.wait_for_timeout(2000)
 
-        if attempt == 1:
+        if attempt in (1, 4, 6):
             page.reload(
                 wait_until="domcontentloaded",
                 timeout=60000,
             )
             page.wait_for_timeout(2000)
+
+    log(f"📋 续期前：{before}")
+    log(f"📋 续期后：{after}")
+
+    try:
+        body_snippet = page.locator(
+            "body"
+        ).inner_text()[:500]
+
+        log(f"📋 页面文本片段：{body_snippet}")
+    except Exception:
+        pass
 
     return False, after
 
@@ -593,14 +783,15 @@ def main():
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
-            headless=True,
+            headless=False,
             proxy={
                 "server": PROXY_SERVER
             }
             if IS_PROXY
             else None,
             args=[
-                "--no-sandbox"
+                "--no-sandbox",
+                "--disable-blink-features=AutomationControlled",
             ],
         )
 
@@ -618,6 +809,21 @@ def main():
             ),
         )
 
+        context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', "
+            "{get: () => undefined});"
+        )
+
+        if HOSTSHIP_COOKIE:
+            count = inject_cookies(
+                context,
+                HOSTSHIP_COOKIE,
+            )
+
+            log(f"🍪 注入 {count} 个 cookie")
+        else:
+            log("⚠️ 未配置 HOSTSHIP_COOKIE")
+
         page = context.new_page()
 
         try:
@@ -630,7 +836,12 @@ def main():
                 tg(
                     build_error_message(
                         "❌ Host-Ship 登录失败",
-                        "登录失败或遇到安全验证",
+                        (
+                            "Cookie 已过期或无效，"
+                            "请在本地浏览器重新登录"
+                            " panel.host-ship.com，"
+                            "更新 HOSTSHIP_COOKIE secret"
+                        ),
                         ip,
                     )
                 )
@@ -644,6 +855,27 @@ def main():
             log(
                 f"📅 当前续期状态：{before}"
             )
+
+            before_days = get_days(before)
+
+            if (
+                before_days is not None
+                and before_days > 5
+            ):
+                log(
+                    f"⏳ 还剩 {before_days} 天，"
+                    "未到续期窗口，不进行操作"
+                )
+
+                if MANUAL_RUN:
+                    tg(
+                        build_check_message(
+                            before,
+                            ip,
+                        )
+                    )
+
+                return 0
 
             body = page.locator(
                 "body"

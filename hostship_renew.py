@@ -82,7 +82,6 @@ def get_days(text):
     if not text:
         return None
 
-    # 优先匹配带 EXPIRES 或 Renewal 的天数，避免误匹配 Maximum 14 days reached
     patterns = [
         r"(\d+)\s*Days?\s*\(EXPIRES",
         r"EXPIRES[^\n\d]*\n\s*(\d+)\s*Days?",
@@ -97,6 +96,15 @@ def get_days(text):
         if match:
             return int(match.group(1))
 
+    return None
+
+
+def get_expire_date_str(text):
+    if not text:
+        return None
+    match = re.search(r"EXPIRES\s+([A-Z0-9\s]+?)[\)\n]", text + "\n", re.I)
+    if match:
+        return match.group(1).strip().upper()
     return None
 
 
@@ -461,6 +469,7 @@ def wait_for_server_panel_loaded(page, timeout_sec=15):
                 kw in body_text.upper()
                 for kw in ["EXPIRES", "UPTIME", "CPU LOAD", "RENEW"]
             ):
+                page.wait_for_timeout(1000)
                 return True
         except Exception:
             pass
@@ -689,27 +698,7 @@ def get_renewal_text(page):
 
 
 def find_renew_button(page):
-    """查找真正的续期按钮，严格排除 Upgrade/Premium 广告链接"""
-    candidates = [
-        page.get_by_role(
-            "button",
-            name=re.compile(
-                r"^(?:Renew(?:\s+Now|\s+Server|\s+for\s+free)?|Extend(?:\s+Server)?|Add\s+\d+\s+days?)$",
-                re.I,
-            ),
-        ),
-        page.get_by_role(
-            "link",
-            name=re.compile(
-                r"^(?:Renew(?:\s+Now|\s+Server|\s+for\s+free)?|Extend(?:\s+Server)?)$",
-                re.I,
-            ),
-        ),
-        page.locator("button").filter(
-            has_text=re.compile(r"\bRenew\b", re.I)
-        ),
-    ]
-
+    """精准查找右侧面板的 Renew 按钮，排除广告容器和外层干扰元素"""
     ignore_words = [
         "upgrade",
         "premium",
@@ -717,110 +706,210 @@ def find_renew_button(page):
         "no renewals",
         "maximum",
         "limit reached",
+        "never expire",
     ]
 
-    for group in candidates:
+    # 优先查找原生 <button> 标签且文本简短明确的按钮
+    buttons = page.locator("button")
+    try:
+        count = buttons.count()
+        for i in range(count):
+            btn = buttons.nth(i)
+            if not btn.is_visible():
+                continue
+            raw_text = (btn.inner_text() or "").strip()
+            clean_text = re.sub(r"\s+", " ", raw_text).lower()
+            if not clean_text:
+                continue
+            if any(w in clean_text for w in ignore_words):
+                continue
+            if re.match(
+                r"^(?:renew(?:\s+now|\s+server|\s+for\s+free)?|extend(?:\s+server)?|add\s+\d+\s+days?)$",
+                clean_text,
+                re.I,
+            ):
+                return btn
+    except Exception:
+        pass
+
+    # 备选：查找带有 role="button" 或 <a> 标签的 Renew 按钮
+    fallback_candidates = [
+        page.get_by_role(
+            "button",
+            name=re.compile(
+                r"^(?:Renew(?:\s+Now|\s+Server|\s+for\s+free)?|Extend(?:\s+Server)?)$",
+                re.I,
+            ),
+        ),
+        page.locator("a, [role='button']").filter(
+            has_text=re.compile(r"^\s*Renew\s*$", re.I)
+        ),
+    ]
+
+    for group in fallback_candidates:
         try:
             count = group.count()
-
             for i in range(count):
                 item = group.nth(i)
-
                 if not item.is_visible():
                     continue
-
                 btn_text = (item.inner_text() or "").strip().lower()
                 if any(w in btn_text for w in ignore_words):
                     continue
-
                 return item
-
         except Exception:
             pass
 
     return None
 
 
-def confirm_renewal(page, before):
-    """
-    等待续期确认弹窗并点击确认；
-    如果新版面板点击 Renew 后无弹窗直接完成续期，也自动识别为成功。
-    """
-    title = page.get_by_text(
-        re.compile(
-            r"Confirm\s+server\s+renewal",
-            re.I,
-        )
-    ).first
-
-    dialog_appeared = False
+def robust_click(page, locator, desc="按钮"):
+    """确保元素滚动到可视区域并执行可靠点击（原生 click + 坐标兜底）"""
     try:
-        title.wait_for(
-            state="visible",
-            timeout=6000,
-        )
-        dialog_appeared = True
+        locator.scroll_into_view_if_needed(timeout=5000)
+        page.wait_for_timeout(300)
     except Exception:
         pass
 
-    if not dialog_appeared:
-        # 检查是否点击第一层按钮后可能弹出了 Turnstile 或者已经直接续期成功
-        click_turnstile_box(page)
-        page.wait_for_timeout(2000)
-        body_text = page.locator("body").inner_text()
-        after = get_renewal_text(page)
-        if renewal_succeeded(before, after, body_text):
-            log("✅ 无需二次弹窗，已直接触发续期")
-            return True
+    try:
+        locator.click(timeout=5000)
+        log(f"🖱️ 已点击 {desc}")
+        return True
+    except Exception as e:
+        log(f"⚠️ 常规点击 {desc} 失败 ({e})，尝试坐标与 JS 点击...")
 
-        log("⚠️ 未检测到标准确认弹窗，继续检查续期结果...")
+    try:
+        box = locator.bounding_box()
+        if box:
+            cx = box["x"] + box["width"] / 2
+            cy = box["y"] + box["height"] / 2
+            page.mouse.move(cx, cy, steps=5)
+            time.sleep(0.1)
+            page.mouse.click(cx, cy)
+            log(f"🖱️ 已通过鼠标坐标点击 {desc}")
+            return True
+    except Exception:
+        pass
+
+    try:
+        locator.evaluate("el => el.click()")
+        log(f"🖱️ 已通过 JS 触发点击 {desc}")
+        return True
+    except Exception:
+        return False
+
+
+def confirm_renewal(page, before, first_renew_btn=None):
+    """
+    处理点击 Renew 后的所有可能流程：
+    1. 弹出模态确认框（含各种按钮文案或内嵌 Turnstile）
+    2. 无弹窗但页面出现 Turnstile 验证
+    3. 点击一次后直接由后端 API 完成续期
+    """
+    page.wait_for_timeout(2000)
+
+    # 先检查是否直接完成了续期
+    body_text = page.locator("body").inner_text()
+    after = get_renewal_text(page)
+    if renewal_succeeded(before, after, body_text):
+        log("✅ 点击 Renew 后已直接完成续期（无需二次弹窗）")
         return True
 
-    confirm_buttons = [
-        page.get_by_role(
-            "dialog"
-        ).last.get_by_role(
-            "button",
-            name=re.compile(
-                r"^Renew(?:\s+now|\s+server)?$",
-                re.I,
-            ),
-        ),
-        page.get_by_role(
-            "button",
-            name=re.compile(
-                r"^Renew\s+now$",
-                re.I,
-            ),
-        ),
-        page.locator(
-            'button:has-text("Renew now")'
-        ),
+    # 检查是否有可能弹出了 Turnstile 验证框
+    if click_turnstile_box(page):
+        log("⏳ 检测到续期阶段 Turnstile 验证，等待通过...")
+        page.wait_for_timeout(4000)
+
+    # 查找页面上所有可能的弹窗确认按钮
+    modal_confirm_selectors = [
+        # 标准 role="dialog" 内部的按钮
+        '[role="dialog"] button:has-text("Renew")',
+        '[role="dialog"] button:has-text("Confirm")',
+        '[role="dialog"] button:has-text("Yes")',
+        '[role="dialog"] button:has-text("Continue")',
+        '[role="dialog"] button[type="submit"]',
+        # 常见 Jexactyl / React Modal / SweetAlert2 容器内的确认按钮
+        '[class*="modal" i] button:has-text("Renew")',
+        '[class*="modal" i] button:has-text("Confirm")',
+        '[class*="dialog" i] button:has-text("Renew")',
+        '[class*="dialog" i] button:has-text("Confirm")',
+        '.swal2-confirm',
+        # 页面上明确叫 Renew now / Confirm renewal 的按钮
+        'button:has-text("Renew now")',
+        'button:has-text("Renew Now")',
+        'button:has-text("Renew Server")',
+        'button:has-text("Confirm")',
     ]
 
-    for group in confirm_buttons:
-        try:
-            count = group.count()
+    ignore_words = ["cancel", "close", "no", "upgrade", "premium"]
 
-            for i in range(count):
-                button = group.nth(i)
-
-                if (
-                    button.is_visible()
-                    and button.is_enabled()
-                ):
-                    log(
-                        "✅ 确认弹窗已打开，"
-                        "点击 Renew now..."
-                    )
-                    button.click()
+    for attempt in range(4):
+        # 1. 尝试按选择器匹配弹窗确认按钮
+        for sel in modal_confirm_selectors:
+            try:
+                loc = page.locator(sel)
+                cnt = loc.count()
+                for i in range(cnt):
+                    btn = loc.nth(i)
+                    if not btn.is_visible() or btn.is_disabled():
+                        continue
+                    txt = (btn.inner_text() or "").strip().lower()
+                    if any(w in txt for w in ignore_words):
+                        continue
+                    log(f"✅ 检测到确认弹窗按钮 [{txt}]，正在点击...")
+                    robust_click(page, btn, f"弹窗确认按钮 ({txt})")
+                    page.wait_for_timeout(2000)
                     return True
+            except Exception:
+                pass
 
+        # 2. 如果页面上同时存在 2 个及以上可见的 "Renew" 按钮，最后一个通常是新弹出的 Modal 确认按钮
+        try:
+            renew_btns = page.locator("button").filter(
+                has_text=re.compile(r"^\s*(?:Renew(?:\s+Now|\s+Server)?|Confirm|Yes)\s*$", re.I)
+            )
+            visible_btns = []
+            for i in range(renew_btns.count()):
+                b = renew_btns.nth(i)
+                if b.is_visible() and not b.is_disabled():
+                    visible_btns.append(b)
+
+            if len(visible_btns) >= 2:
+                target_btn = visible_btns[-1]
+                txt = (target_btn.inner_text() or "").strip()
+                log(f"✅ 检测到第二个激活的确认按钮 [{txt}]，正在点击...")
+                robust_click(page, target_btn, f"二次确认按钮 ({txt})")
+                page.wait_for_timeout(2000)
+                return True
         except Exception:
             pass
 
-    log("❌ 确认弹窗中未找到可点击的 Renew now")
-    return False
+        # 3. 检查是否因为第一次点击没触发反应，尝试补点一次原按钮
+        if attempt == 1 and first_renew_btn is not None:
+            body_now = page.locator("body").inner_text()
+            after_now = get_renewal_text(page)
+            if not renewal_succeeded(before, after_now, body_now):
+                log("🔄 未检测到弹窗或状态变化，尝试使用鼠标坐标再次点击 Renew 按钮...")
+                try:
+                    box = first_renew_btn.bounding_box()
+                    if box:
+                        page.mouse.click(
+                            box["x"] + box["width"] / 2,
+                            box["y"] + box["height"] / 2,
+                        )
+                except Exception:
+                    pass
+
+        click_turnstile_box(page)
+        page.wait_for_timeout(1500)
+
+        body_text = page.locator("body").inner_text()
+        after = get_renewal_text(page)
+        if renewal_succeeded(before, after, body_text):
+            return True
+
+    log("⚠️ 未检测到标准确认弹窗，继续检查续期结果...")
+    return True
 
 
 def renewal_succeeded(before, after, body_text):
@@ -829,8 +918,11 @@ def renewal_succeeded(before, after, body_text):
         "renewed successfully",
         "renewal successful",
         "successfully renewed",
+        "has been renewed",
+        "server renewed",
         "renew limit reached",
         "maximum 14 days reached",
+        "you can renew again",
     ]
 
     if any(word in text for word in success_words):
@@ -839,18 +931,31 @@ def renewal_succeeded(before, after, body_text):
     before_days = get_days(before)
     after_days = get_days(after)
 
-    return (
+    if (
         before_days is not None
         and after_days is not None
         and after_days > before_days
-    )
+    ):
+        return True
+
+    # 对比 EXPIRES 日期字符串是否发生变化（例如从 5 NOV 变成 6 NOV 或 19 NOV）
+    before_exp = get_expire_date_str(before)
+    after_exp = get_expire_date_str(after)
+    if (
+        before_exp
+        and after_exp
+        and before_exp != after_exp
+    ):
+        return True
+
+    return False
 
 
-def wait_for_renewal_result(page, before):
-    """Poll once, then reload to avoid reading a stale SPA state."""
+def wait_for_renewal_result(page, before, api_renew_ok=False):
+    """轮询页面状态并刷新页面，避免 SPA 缓存导致读取到旧的剩余天数"""
     after = get_renewal_text(page)
 
-    for attempt in range(5):
+    for attempt in range(6):
         body_text = page.locator(
             "body"
         ).inner_text()
@@ -865,12 +970,19 @@ def wait_for_renewal_result(page, before):
 
         page.wait_for_timeout(2000)
 
-        if attempt == 1:
+        # 在第 2 次和第 4 次轮询时主动刷新页面，强制从服务端拉取最新到期时间
+        if attempt in (1, 3):
+            log("🔄 刷新页面以获取最新到期状态...")
             page.reload(
                 wait_until="domcontentloaded",
                 timeout=60000,
             )
             wait_for_server_panel_loaded(page)
+
+    # 如果监听到了后端 renew 接口返回 200/204 成功，也视为成功
+    if api_renew_ok:
+        after = get_renewal_text(page)
+        return True, after
 
     return False, after
 
@@ -952,6 +1064,26 @@ def main():
 
         page = context.new_page()
 
+        # 监听网络请求，捕捉是否触发了后端的 renew API
+        renew_api_status = {"called": False, "ok": False, "status": None, "body": ""}
+
+        def on_response(response):
+            try:
+                url_lower = response.url.lower()
+                if "renew" in url_lower and response.request.method in ("POST", "PUT", "PATCH"):
+                    renew_api_status["called"] = True
+                    renew_api_status["status"] = response.status
+                    renew_api_status["ok"] = 200 <= response.status < 300
+                    try:
+                        renew_api_status["body"] = response.text()[:300]
+                    except Exception:
+                        pass
+                    log(f"📡 捕获到续期 API 响应: HTTP {response.status} ({response.url})")
+            except Exception:
+                pass
+
+        page.on("response", on_response)
+
         try:
             if not login_if_needed(page):
                 page.screenshot(
@@ -1020,13 +1152,12 @@ def main():
 
             try:
                 disabled = button.is_disabled()
-
             except Exception:
                 disabled = False
 
             if disabled:
                 log(
-                    "⏳ Renew 按钮当前不可点击"
+                    "⏳ Renew 按钮当前不可点击（disabled）"
                 )
 
                 if MANUAL_RUN:
@@ -1044,9 +1175,9 @@ def main():
                 "点击 Renew..."
             )
 
-            button.click()
+            robust_click(page, button, "Renew 主按钮")
 
-            if not confirm_renewal(page, before):
+            if not confirm_renewal(page, before, first_renew_btn=button):
                 page.screenshot(
                     path="hostship_confirm_fail.png",
                     full_page=True,
@@ -1057,7 +1188,7 @@ def main():
                         "❌ Host-Ship 续期确认失败",
                         (
                             "点击第一层 Renew 后，"
-                            "未能点击确认弹窗中的 Renew now"
+                            "未能完成二次确认"
                         ),
                         ip,
                     )
@@ -1068,6 +1199,7 @@ def main():
             success, after = wait_for_renewal_result(
                 page,
                 before,
+                api_renew_ok=renew_api_status["ok"],
             )
 
             if success:
@@ -1086,6 +1218,13 @@ def main():
 
                 return 0
 
+            # 如果 API 明确返回了错误码（例如 400/403/429 提示还未到可续期时间）
+            if renew_api_status["called"] and not renew_api_status["ok"]:
+                log(
+                    f"⚠️ 续期 API 返回状态码 {renew_api_status['status']}: "
+                    f"{renew_api_status['body']}"
+                )
+
             page.screenshot(
                 path="hostship_renew_uncertain.png",
                 full_page=True,
@@ -1096,12 +1235,19 @@ def main():
                 "但无法确认结果"
             )
 
+            extra_api_info = (
+                f"\nAPI响应：HTTP {renew_api_status['status']} ({renew_api_status['body']})"
+                if renew_api_status["called"]
+                else "\nAPI响应：未捕获到后端续期请求"
+            )
+
             tg(
                 build_error_message(
                     "⚠️ Host-Ship 续期结果需要检查",
                     (
                         f"续期前：{before}；"
                         f"续期后：{after}"
+                        f"{extra_api_info}"
                     ),
                     ip,
                 )

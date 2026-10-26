@@ -118,7 +118,6 @@ def estimate_renew_date(status):
     if days is None:
         return None
 
-    # 面板规则：低于 14 天（<= 13 天）时才可续期
     wait_days = days - 13 if days >= 14 else 0
 
     return (
@@ -197,7 +196,7 @@ def current_ip():
         return "获取失败"
 
 
-def build_check_message(status, ip):
+def build_check_message(status, ip, reason="未到续期时间（需低于 14 天）"):
     days = get_days(status)
     renew_date = estimate_renew_date(status)
     now = beijing_now()
@@ -210,23 +209,19 @@ def build_check_message(status, ip):
         f"📍 出口IP：{ip}",
         f"🕗 检查时间：{now.strftime('%Y/%m/%d %H:%M')}",
         "",
-        "🔒 当前状态：未到续期时间（需低于 14 天）",
+        f"🔒 当前状态：{reason}",
     ]
 
     if days is not None:
         lines.append(
             f"⏱️ 剩余有效期：{status}"
         )
-        wait_days = max(0, days - 13)
-        lines.append(
-            f"⏳ 距离可续期：约 {wait_days} 天"
-        )
     else:
         lines.append(
             f"📅 面板状态：{status}"
         )
 
-    if renew_date is not None:
+    if renew_date is not None and days is not None and days >= 14:
         lines.append(
             "📆 预计可续期："
             + renew_date.strftime("%Y/%m/%d")
@@ -385,7 +380,7 @@ def click_turnstile_box(page, password_locator=None, submit_locator=None):
             pass
 
     try:
-        divs = page.locator("form div")
+        divs = page.locator("form div, [role='dialog'] div")
         count = divs.count()
         for i in range(count):
             div = divs.nth(i)
@@ -403,7 +398,7 @@ def click_turnstile_box(page, password_locator=None, submit_locator=None):
                     page.mouse.move(target_x, target_y, steps=8)
                     time.sleep(0.15)
                     page.mouse.click(target_x, target_y)
-                    log("🖱️ 已通过表单内尺寸匹配点击 Turnstile 区域")
+                    log("🖱️ 已通过尺寸匹配点击 Turnstile 区域")
                     return True
     except Exception:
         pass
@@ -469,7 +464,7 @@ def wait_for_server_panel_loaded(page, timeout_sec=15):
                 kw in body_text.upper()
                 for kw in ["EXPIRES", "UPTIME", "CPU LOAD", "RENEW"]
             ):
-                page.wait_for_timeout(1000)
+                page.wait_for_timeout(1500)
                 return True
         except Exception:
             pass
@@ -639,6 +634,8 @@ def is_renew_limit_reached(body_text):
         r"Maximum\s+\d+\s+days?\s+reached",
         r"You\s+can\s+renew\s+again\s+tomorrow",
         r"when\s+it\s+drops\s+below\s+\d+\s+days?",
+        r"cannot\s+be\s+renewed\s+yet",
+        r"already\s+renewed",
     ]
     for pattern in limit_patterns:
         if re.search(pattern, body_text, re.I):
@@ -651,7 +648,6 @@ def get_renewal_text(page):
         "body"
     ).inner_text()
 
-    # 1. 匹配新版 Jexactyl 面板卡片格式：EXPIRES 6 NOV \n 17 Days
     expires_match = re.search(
         r"EXPIRES\s+([A-Z0-9\s]+?)\s*\n+\s*(\d+\s*Days?)",
         text,
@@ -662,7 +658,6 @@ def get_renewal_text(page):
         days_str = expires_match.group(2).strip()
         return f"{days_str} (EXPIRES {exp_date})"
 
-    # 2. 兼容旧版格式
     patterns = [
         r"Renewal\s+in\s+\d+\s+Days?",
         r"Renew\s+in\s+\d+\s+Days?",
@@ -678,7 +673,6 @@ def get_renewal_text(page):
         if match:
             return match.group(0)
 
-    # 3. 匹配达到上限的提示
     max_match = re.search(
         r"Maximum\s+\d+\s+days?\s+reached",
         text,
@@ -697,8 +691,49 @@ def get_renewal_text(page):
     return "未识别"
 
 
-def find_renew_button(page):
-    """精准查找右侧面板的 Renew 按钮，排除广告容器和外层干扰元素"""
+def inspect_renew_elements(page):
+    """打印页面上所有包含 Renew 字样的可见元素详情（标签、文本、坐标、属性），彻底告别盲猜"""
+    info_list = page.evaluate("""() => {
+        const results = [];
+        const all = document.querySelectorAll('button, a, [role="button"], div, span');
+        for (const el of all) {
+            const text = (el.innerText || '').trim().replace(/\\s+/g, ' ');
+            if (!text || !/renew/i.test(text) || text.length > 60) continue;
+            const rect = el.getBoundingClientRect();
+            if (rect.width === 0 || rect.height === 0) continue;
+            // 只记录叶子节点或直接按钮，避免整页父容器刷屏
+            if (el.tagName === 'DIV' && el.querySelectorAll('button, a').length > 0) continue;
+            results.push({
+                tag: el.tagName.toLowerCase(),
+                text: text,
+                x: Math.round(rect.x),
+                y: Math.round(rect.y),
+                w: Math.round(rect.width),
+                h: Math.round(rect.height),
+                disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true',
+                href: el.getAttribute('href') || '',
+                className: (el.className && typeof el.className === 'string') ? el.className.slice(0, 80) : ''
+            });
+        }
+        return results;
+    }""")
+    log("🔍 页面上与 Renew 相关的元素列表：")
+    for idx, item in enumerate(info_list):
+        log(
+            f"   [{idx}] <{item['tag']}> text='{item['text']}' "
+            f"pos=({item['x']},{item['y']} {item['w']}x{item['h']}) "
+            f"disabled={item['disabled']} href='{item['href']}'"
+        )
+    return info_list
+
+
+def find_right_panel_renew_button(page):
+    """
+    精准定位右侧状态栏（EXPIRES 卡片下方）的 Renew 按钮，
+    严格排除左侧导航栏（x < 300）的 'Renew server' 菜单和下方的 Upgrade 广告
+    """
+    inspect_renew_elements(page)
+
     ignore_words = [
         "upgrade",
         "premium",
@@ -709,206 +744,298 @@ def find_renew_button(page):
         "never expire",
     ]
 
-    # 优先查找原生 <button> 标签且文本简短明确的按钮
+    # 1. 优先寻找位于页面右侧（x > 500）且文字为 Renew 的按钮/可点击元素
+    candidates = page.locator("button, a, [role='button'], div")
+    best_match = None
+
+    try:
+        count = candidates.count()
+        for i in range(count):
+            el = candidates.nth(i)
+            if not el.is_visible():
+                continue
+
+            raw_text = (el.inner_text() or "").strip()
+            clean_text = re.sub(r"\s+", " ", raw_text)
+            if not clean_text or len(clean_text) > 30:
+                continue
+
+            lower_text = clean_text.lower()
+            if any(w in lower_text for w in ignore_words):
+                continue
+
+            # 匹配 "Renew" 或 "Renew Now"
+            if not re.match(r"^renew(?:\s+now)?$", lower_text, re.I):
+                continue
+
+            box = el.bounding_box()
+            if not box:
+                continue
+
+            # 右侧面板的卡片宽度通常在 200~500 之间，且 x 坐标在右侧（> 500）
+            if box["x"] > 500 and 80 <= box["width"] <= 550 and 24 <= box["height"] <= 80:
+                tag_name = el.evaluate("el => el.tagName.toLowerCase()")
+                log(
+                    f"🎯 锁定右侧 Renew 按钮: <{tag_name}> '{clean_text}' "
+                    f"坐标=({int(box['x'])}, {int(box['y'])}, {int(box['width'])}x{int(box['height'])})"
+                )
+                # 如果它是 button 或 a，直接返回；如果是外层 div，继续看里面有没有子 button
+                if tag_name in ("button", "a"):
+                    return el
+                best_match = el
+    except Exception as exc:
+        log(f"⚠️ 扫描右侧按钮异常: {exc}")
+
+    if best_match is not None:
+        return best_match
+
+    # 2. 退一步：查找任意 x > 300 的含 Renew 的 button
     buttons = page.locator("button")
     try:
-        count = buttons.count()
-        for i in range(count):
+        for i in range(buttons.count()):
             btn = buttons.nth(i)
             if not btn.is_visible():
                 continue
-            raw_text = (btn.inner_text() or "").strip()
-            clean_text = re.sub(r"\s+", " ", raw_text).lower()
-            if not clean_text:
+            txt = re.sub(r"\s+", " ", (btn.inner_text() or "").strip()).lower()
+            if any(w in txt for w in ignore_words):
                 continue
-            if any(w in clean_text for w in ignore_words):
-                continue
-            if re.match(
-                r"^(?:renew(?:\s+now|\s+server|\s+for\s+free)?|extend(?:\s+server)?|add\s+\d+\s+days?)$",
-                clean_text,
-                re.I,
-            ):
-                return btn
+            if "renew" in txt:
+                box = btn.bounding_box()
+                if box and box["x"] > 300:
+                    return btn
     except Exception:
         pass
-
-    # 备选：查找带有 role="button" 或 <a> 标签的 Renew 按钮
-    fallback_candidates = [
-        page.get_by_role(
-            "button",
-            name=re.compile(
-                r"^(?:Renew(?:\s+Now|\s+Server|\s+for\s+free)?|Extend(?:\s+Server)?)$",
-                re.I,
-            ),
-        ),
-        page.locator("a, [role='button']").filter(
-            has_text=re.compile(r"^\s*Renew\s*$", re.I)
-        ),
-    ]
-
-    for group in fallback_candidates:
-        try:
-            count = group.count()
-            for i in range(count):
-                item = group.nth(i)
-                if not item.is_visible():
-                    continue
-                btn_text = (item.inner_text() or "").strip().lower()
-                if any(w in btn_text for w in ignore_words):
-                    continue
-                return item
-        except Exception:
-            pass
 
     return None
 
 
-def robust_click(page, locator, desc="按钮"):
-    """确保元素滚动到可视区域并执行可靠点击（原生 click + 坐标兜底）"""
+def trigger_click_all_ways(page, locator, desc="按钮"):
+    """使用 Playwright click + 真实鼠标移动点击 + JS dispatchEvent 确保 React 100% 收到点击事件"""
     try:
         locator.scroll_into_view_if_needed(timeout=5000)
         page.wait_for_timeout(300)
     except Exception:
         pass
 
-    try:
-        locator.click(timeout=5000)
-        log(f"🖱️ 已点击 {desc}")
-        return True
-    except Exception as e:
-        log(f"⚠️ 常规点击 {desc} 失败 ({e})，尝试坐标与 JS 点击...")
-
+    box = None
     try:
         box = locator.bounding_box()
-        if box:
-            cx = box["x"] + box["width"] / 2
-            cy = box["y"] + box["height"] / 2
-            page.mouse.move(cx, cy, steps=5)
-            time.sleep(0.1)
-            page.mouse.click(cx, cy)
-            log(f"🖱️ 已通过鼠标坐标点击 {desc}")
-            return True
     except Exception:
         pass
 
+    if box:
+        cx = box["x"] + box["width"] / 2
+        cy = box["y"] + box["height"] / 2
+        log(f"🖱️ 移动鼠标并点击 {desc} 中心坐标: ({int(cx)}, {int(cy)})")
+        page.mouse.move(cx, cy, steps=8)
+        time.sleep(0.15)
+        page.mouse.down()
+        time.sleep(0.08)
+        page.mouse.up()
+        page.wait_for_timeout(500)
+
     try:
-        locator.evaluate("el => el.click()")
-        log(f"🖱️ 已通过 JS 触发点击 {desc}")
-        return True
+        locator.click(timeout=4000)
     except Exception:
-        return False
+        pass
 
 
-def confirm_renewal(page, before, first_renew_btn=None):
+def dump_page_diff(before_lines, page):
+    """打印点击按钮后页面上新出现的文字（如弹窗内容、Toast 提示）"""
+    try:
+        current_text = page.locator("body").inner_text()
+        current_lines = [
+            line.strip()
+            for line in current_text.splitlines()
+            if line.strip()
+        ]
+        added = [
+            line for line in current_lines
+            if line not in before_lines and not line.startswith("[定时重启")
+        ]
+        if added:
+            log(f"📄 点击后页面新增文本: {added[:15]}")
+        else:
+            log("📄 点击后页面文本无明显新增")
+        return added
+    except Exception:
+        return []
+
+
+def handle_post_click_flow(page, before, right_renew_btn, api_tracker):
     """
-    处理点击 Renew 后的所有可能流程：
-    1. 弹出模态确认框（含各种按钮文案或内嵌 Turnstile）
-    2. 无弹窗但页面出现 Turnstile 验证
-    3. 点击一次后直接由后端 API 完成续期
+    处理点击右侧 Renew 后的完整交互：
+    - 检测页面 URL 变化或新增弹窗文本
+    - 处理弹窗内可能存在的 Cloudflare Turnstile 验证码
+    - 点击弹窗内的确认按钮
+    - 如果右侧按钮毫无反应，尝试点击左侧导航栏的 'Renew server' 页面进行续期
     """
-    page.wait_for_timeout(2000)
+    before_body = page.locator("body").inner_text()
+    before_lines = set(
+        line.strip() for line in before_body.splitlines() if line.strip()
+    )
 
-    # 先检查是否直接完成了续期
-    body_text = page.locator("body").inner_text()
-    after = get_renewal_text(page)
-    if renewal_succeeded(before, after, body_text):
-        log("✅ 点击 Renew 后已直接完成续期（无需二次弹窗）")
+    trigger_click_all_ways(page, right_renew_btn, "右侧 Renew 主按钮")
+    page.wait_for_timeout(2500)
+
+    added_lines = dump_page_diff(before_lines, page)
+
+    # 如果第一次点完页面没有任何新增文本，也没触发任何 API，可能是点到了按钮里的图标或外层，尝试用 JS 直接点击该元素及其父/子元素
+    if not added_lines and not api_tracker["called"]:
+        log("🔄 第一次点击未触发弹窗或 API，尝试通过 JS 触发按钮及父级点击事件...")
+        try:
+            right_renew_btn.evaluate("""el => {
+                el.click();
+                if (el.parentElement) el.parentElement.click();
+                const btn = el.querySelector('button, a');
+                if (btn) btn.click();
+            }""")
+        except Exception:
+            pass
+        page.wait_for_timeout(2500)
+        added_lines = dump_page_diff(before_lines, page)
+
+    # 检查是否已经直接续期成功或弹出提示（如冷却时间未到）
+    body_now = page.locator("body").inner_text()
+    after_now = get_renewal_text(page)
+    if renewal_succeeded(before, after_now, body_now):
+        log("✅ 点击后已直接完成续期")
         return True
 
-    # 检查是否有可能弹出了 Turnstile 验证框
-    if click_turnstile_box(page):
-        log("⏳ 检测到续期阶段 Turnstile 验证，等待通过...")
-        page.wait_for_timeout(4000)
+    # 检查页面上是否出现了 Turnstile 验证框（很多 Jexactyl 面板点击 Renew 后会在弹窗或按钮下方渲染 Turnstile）
+    for wait_round in range(6):
+        if click_turnstile_box(page):
+            log(f"⏳ 已点击续期阶段的 Turnstile 验证框 (第 {wait_round + 1} 次)，等待验证通过...")
+            page.wait_for_timeout(3500)
+        else:
+            break
 
-    # 查找页面上所有可能的弹窗确认按钮
-    modal_confirm_selectors = [
-        # 标准 role="dialog" 内部的按钮
-        '[role="dialog"] button:has-text("Renew")',
-        '[role="dialog"] button:has-text("Confirm")',
-        '[role="dialog"] button:has-text("Yes")',
-        '[role="dialog"] button:has-text("Continue")',
-        '[role="dialog"] button[type="submit"]',
-        # 常见 Jexactyl / React Modal / SweetAlert2 容器内的确认按钮
-        '[class*="modal" i] button:has-text("Renew")',
-        '[class*="modal" i] button:has-text("Confirm")',
-        '[class*="dialog" i] button:has-text("Renew")',
-        '[class*="dialog" i] button:has-text("Confirm")',
+    # 扫描当前页面所有按钮，看看有没有新出现的弹窗确认按钮（Confirm / Renew now / Yes 等）
+    inspect_renew_elements(page)
+
+    modal_selectors = [
+        '[role="dialog"] button',
+        '[class*="modal" i] button',
+        '[class*="dialog" i] button',
         '.swal2-confirm',
-        # 页面上明确叫 Renew now / Confirm renewal 的按钮
         'button:has-text("Renew now")',
         'button:has-text("Renew Now")',
-        'button:has-text("Renew Server")',
         'button:has-text("Confirm")',
+        'button:has-text("Yes")',
+        'button:has-text("Continue")',
+        'button[type="submit"]',
     ]
 
-    ignore_words = ["cancel", "close", "no", "upgrade", "premium"]
+    ignore_words = ["cancel", "close", "no", "upgrade", "premium", " dismissal"]
 
     for attempt in range(4):
-        # 1. 尝试按选择器匹配弹窗确认按钮
-        for sel in modal_confirm_selectors:
+        click_turnstile_box(page)
+
+        for sel in modal_selectors:
             try:
                 loc = page.locator(sel)
-                cnt = loc.count()
-                for i in range(cnt):
+                for i in range(loc.count()):
                     btn = loc.nth(i)
-                    if not btn.is_visible() or btn.is_disabled():
+                    if not btn.is_visible():
                         continue
-                    txt = (btn.inner_text() or "").strip().lower()
-                    if any(w in txt for w in ignore_words):
+                    txt = re.sub(r"\s+", " ", (btn.inner_text() or "").strip())
+                    if not txt or any(w in txt.lower() for w in ignore_words):
                         continue
-                    log(f"✅ 检测到确认弹窗按钮 [{txt}]，正在点击...")
-                    robust_click(page, btn, f"弹窗确认按钮 ({txt})")
-                    page.wait_for_timeout(2000)
-                    return True
+                    if btn.is_disabled():
+                        log(f"⏳ 发现弹窗按钮 [{txt}] 但处于禁用状态，尝试等待 Turnstile 解锁...")
+                        click_turnstile_box(page)
+                        page.wait_for_timeout(3000)
+                    if not btn.is_disabled():
+                        log(f"✅ 点击弹窗确认按钮: [{txt}]")
+                        trigger_click_all_ways(page, btn, f"弹窗确认按钮 ({txt})")
+                        page.wait_for_timeout(2500)
+                        dump_page_diff(before_lines, page)
+                        return True
             except Exception:
                 pass
 
-        # 2. 如果页面上同时存在 2 个及以上可见的 "Renew" 按钮，最后一个通常是新弹出的 Modal 确认按钮
-        try:
-            renew_btns = page.locator("button").filter(
-                has_text=re.compile(r"^\s*(?:Renew(?:\s+Now|\s+Server)?|Confirm|Yes)\s*$", re.I)
-            )
-            visible_btns = []
-            for i in range(renew_btns.count()):
-                b = renew_btns.nth(i)
-                if b.is_visible() and not b.is_disabled():
-                    visible_btns.append(b)
-
-            if len(visible_btns) >= 2:
-                target_btn = visible_btns[-1]
-                txt = (target_btn.inner_text() or "").strip()
-                log(f"✅ 检测到第二个激活的确认按钮 [{txt}]，正在点击...")
-                robust_click(page, target_btn, f"二次确认按钮 ({txt})")
-                page.wait_for_timeout(2000)
-                return True
-        except Exception:
-            pass
-
-        # 3. 检查是否因为第一次点击没触发反应，尝试补点一次原按钮
-        if attempt == 1 and first_renew_btn is not None:
-            body_now = page.locator("body").inner_text()
-            after_now = get_renewal_text(page)
-            if not renewal_succeeded(before, after_now, body_now):
-                log("🔄 未检测到弹窗或状态变化，尝试使用鼠标坐标再次点击 Renew 按钮...")
-                try:
-                    box = first_renew_btn.bounding_box()
-                    if box:
-                        page.mouse.click(
-                            box["x"] + box["width"] / 2,
-                            box["y"] + box["height"] / 2,
-                        )
-                except Exception:
-                    pass
-
-        click_turnstile_box(page)
         page.wait_for_timeout(1500)
 
-        body_text = page.locator("body").inner_text()
-        after = get_renewal_text(page)
-        if renewal_succeeded(before, after, body_text):
-            return True
+    # 如果右侧的 Renew 按钮点击后完全是死按钮（前端 Bug），尝试点击左侧边栏的 "Renew server" 菜单项或者直接请求后端续期 API
+    if not api_tracker["called"]:
+        log("⚠️ 点击右侧 Renew 未触发任何后端请求，尝试查找左侧菜单 'Renew server' 或直接调用后端续期 API...")
 
-    log("⚠️ 未检测到标准确认弹窗，继续检查续期结果...")
+        # 尝试点击左侧导航栏中的 Renew server
+        try:
+            left_renew = page.locator("a, button, div, span").filter(
+                has_text=re.compile(r"^Renew\s+server$", re.I)
+            ).first
+            if left_renew.count() and left_renew.is_visible():
+                log("🧭 发现左侧边栏 'Renew server' 入口，正在点击进入...")
+                trigger_click_all_ways(page, left_renew, "左侧 Renew server 菜单")
+                page.wait_for_timeout(3000)
+                dump_page_diff(before_lines, page)
+                inspect_renew_elements(page)
+
+                # 如果进入了专门的续期子页面或弹出了新界面，处理里面的 Turnstile 和按钮
+                for _ in range(3):
+                    click_turnstile_box(page)
+                    page.wait_for_timeout(2000)
+
+                sub_btns = page.locator("button")
+                for i in range(sub_btns.count()):
+                    b = sub_btns.nth(i)
+                    if not b.is_visible() or b.is_disabled():
+                        continue
+                    t = re.sub(r"\s+", " ", (b.inner_text() or "").strip())
+                    if re.search(r"renew|confirm|extend", t, re.I) and not any(
+                        w in t.lower() for w in ignore_words
+                    ):
+                        log(f"🖱️ 在子界面中点击续期按钮: [{t}]")
+                        trigger_click_all_ways(page, b, f"子页面按钮 ({t})")
+                        page.wait_for_timeout(3000)
+                        break
+        except Exception as exc:
+            log(f"⚠️ 尝试左侧菜单异常: {exc}")
+
+    # 终极保底：如果还是没有触发任何 renew API，在浏览器上下文内直接用 fetch 探测常见的 Jexactyl/Pterodactyl 续期 API 端点
+    if not api_tracker["called"]:
+        srv_id = server_id()
+        log(f"📡 尝试通过浏览器会话直接调用后端续期接口 (Server ID: {srv_id})...")
+        api_results = page.evaluate("""async (srvId) => {
+            const csrfMeta = document.querySelector('meta[name="csrf-token"]');
+            const xsrfCookie = document.cookie.split('; ').find(row => row.startsWith('XSRF-TOKEN='));
+            const xsrfToken = xsrfCookie ? decodeURIComponent(xsrfCookie.split('=')[1]) : '';
+            const headers = {
+                'Accept': 'application/json, text/plain, */*',
+                'Content-Type': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest'
+            };
+            if (csrfMeta && csrfMeta.content) headers['X-CSRF-TOKEN'] = csrfMeta.content;
+            if (xsrfToken) headers['X-XSRF-TOKEN'] = xsrfToken;
+
+            const endpoints = [
+                `/api/client/servers/${srvId}/renew`,
+                `/api/client/servers/${srvId}/renewal`,
+                `/api/client/store/renew/${srvId}`,
+            ];
+            const logs = [];
+            for (const ep of endpoints) {
+                try {
+                    const res = await fetch(ep, {
+                        method: 'POST',
+                        headers: headers,
+                        credentials: 'same-origin',
+                        body: JSON.stringify({})
+                    });
+                    const txt = await res.text();
+                    logs.push({ ep, status: res.status, body: txt.slice(0, 200) });
+                    if (res.status >= 200 && res.status < 300) break;
+                } catch (e) {
+                    logs.push({ ep, status: 0, body: String(e) });
+                }
+            }
+            return logs;
+        }""", srv_id)
+
+        for r in api_results:
+            log(f"   -> POST {r['ep']} => HTTP {r['status']} | {r['body']}")
+
     return True
 
 
@@ -938,7 +1065,6 @@ def renewal_succeeded(before, after, body_text):
     ):
         return True
 
-    # 对比 EXPIRES 日期字符串是否发生变化（例如从 5 NOV 变成 6 NOV 或 19 NOV）
     before_exp = get_expire_date_str(before)
     after_exp = get_expire_date_str(after)
     if (
@@ -952,34 +1078,27 @@ def renewal_succeeded(before, after, body_text):
 
 
 def wait_for_renewal_result(page, before, api_renew_ok=False):
-    """轮询页面状态并刷新页面，避免 SPA 缓存导致读取到旧的剩余天数"""
+    """轮询并重新回到服务器主页检查最新到期天数"""
     after = get_renewal_text(page)
 
-    for attempt in range(6):
-        body_text = page.locator(
-            "body"
-        ).inner_text()
+    for attempt in range(5):
+        if SERVER_URL not in page.url:
+            page.goto(SERVER_URL, wait_until="domcontentloaded", timeout=60000)
+            wait_for_server_panel_loaded(page)
+
+        body_text = page.locator("body").inner_text()
         after = get_renewal_text(page)
 
-        if renewal_succeeded(
-            before,
-            after,
-            body_text,
-        ):
+        if renewal_succeeded(before, after, body_text):
             return True, after
 
         page.wait_for_timeout(2000)
 
-        # 在第 2 次和第 4 次轮询时主动刷新页面，强制从服务端拉取最新到期时间
         if attempt in (1, 3):
             log("🔄 刷新页面以获取最新到期状态...")
-            page.reload(
-                wait_until="domcontentloaded",
-                timeout=60000,
-            )
+            page.goto(SERVER_URL, wait_until="domcontentloaded", timeout=60000)
             wait_for_server_panel_loaded(page)
 
-    # 如果监听到了后端 renew 接口返回 200/204 成功，也视为成功
     if api_renew_ok:
         after = get_renewal_text(page)
         return True, after
@@ -1064,21 +1183,27 @@ def main():
 
         page = context.new_page()
 
-        # 监听网络请求，捕捉是否触发了后端的 renew API
-        renew_api_status = {"called": False, "ok": False, "status": None, "body": ""}
+        # 监听所有非静态资源的 POST/PUT/PATCH/DELETE 请求以及含 renew 的请求
+        api_tracker = {"called": False, "ok": False, "status": None, "body": ""}
 
         def on_response(response):
             try:
-                url_lower = response.url.lower()
-                if "renew" in url_lower and response.request.method in ("POST", "PUT", "PATCH"):
-                    renew_api_status["called"] = True
-                    renew_api_status["status"] = response.status
-                    renew_api_status["ok"] = 200 <= response.status < 300
+                url = response.url
+                method = response.request.method
+                if any(ext in url for ext in (".js", ".css", ".png", ".woff", ".svg", "cloudflare")):
+                    return
+                if method in ("POST", "PUT", "PATCH", "DELETE") or "renew" in url.lower():
+                    body_preview = ""
                     try:
-                        renew_api_status["body"] = response.text()[:300]
+                        body_preview = response.text()[:300].replace("\n", " ")
                     except Exception:
                         pass
-                    log(f"📡 捕获到续期 API 响应: HTTP {response.status} ({response.url})")
+                    log(f"📡 网络响应 [{method}] HTTP {response.status} -> {url} | {body_preview}")
+                    if "renew" in url.lower():
+                        api_tracker["called"] = True
+                        api_tracker["status"] = response.status
+                        api_tracker["ok"] = 200 <= response.status < 300
+                        api_tracker["body"] = body_preview
             except Exception:
                 pass
 
@@ -1129,7 +1254,7 @@ def main():
 
                 return 0
 
-            button = find_renew_button(page)
+            button = find_right_panel_renew_button(page)
 
             if not button:
                 page.screenshot(
@@ -1151,13 +1276,15 @@ def main():
                 return 1
 
             try:
-                disabled = button.is_disabled()
+                disabled = button.is_disabled() or (
+                    button.get_attribute("aria-disabled") == "true"
+                )
             except Exception:
                 disabled = False
 
             if disabled:
                 log(
-                    "⏳ Renew 按钮当前不可点击（disabled）"
+                    "⏳ Renew 按钮当前处于禁用状态（未到可续期冷却窗口）"
                 )
 
                 if MANUAL_RUN:
@@ -1165,41 +1292,22 @@ def main():
                         build_check_message(
                             before,
                             ip,
+                            reason="Renew 按钮当前处于禁用/冷却状态",
                         )
                     )
 
                 return 0
 
             log(
-                "🔄 已到续期窗口，"
-                "点击 Renew..."
+                "🔄 已定位右侧 Renew 按钮，开始执行续期流程..."
             )
 
-            robust_click(page, button, "Renew 主按钮")
-
-            if not confirm_renewal(page, before, first_renew_btn=button):
-                page.screenshot(
-                    path="hostship_confirm_fail.png",
-                    full_page=True,
-                )
-
-                tg(
-                    build_error_message(
-                        "❌ Host-Ship 续期确认失败",
-                        (
-                            "点击第一层 Renew 后，"
-                            "未能完成二次确认"
-                        ),
-                        ip,
-                    )
-                )
-
-                return 1
+            handle_post_click_flow(page, before, button, api_tracker)
 
             success, after = wait_for_renewal_result(
                 page,
                 before,
-                api_renew_ok=renew_api_status["ok"],
+                api_renew_ok=api_tracker["ok"],
             )
 
             if success:
@@ -1218,12 +1326,22 @@ def main():
 
                 return 0
 
-            # 如果 API 明确返回了错误码（例如 400/403/429 提示还未到可续期时间）
-            if renew_api_status["called"] and not renew_api_status["ok"]:
-                log(
-                    f"⚠️ 续期 API 返回状态码 {renew_api_status['status']}: "
-                    f"{renew_api_status['body']}"
-                )
+            # 如果后端明确返回了冷却限制提示（例如 400/429 Too Many Requests 或未到时间）
+            api_body_lower = (api_tracker.get("body") or "").lower()
+            if any(
+                kw in api_body_lower
+                for kw in ("limit", "maximum", "already", "wait", "cooldown", "hours", "days", "cannot")
+            ):
+                log(f"⏳ 后端接口提示当前暂不可续期: {api_tracker['body']}")
+                if MANUAL_RUN:
+                    tg(
+                        build_check_message(
+                            before,
+                            ip,
+                            reason=f"后端提示：{api_tracker['body']}",
+                        )
+                    )
+                return 0
 
             page.screenshot(
                 path="hostship_renew_uncertain.png",
@@ -1231,13 +1349,12 @@ def main():
             )
 
             log(
-                "⚠️ 已点击续期，"
-                "但无法确认结果"
+                "⚠️ 已点击续期，但无法确认结果"
             )
 
             extra_api_info = (
-                f"\nAPI响应：HTTP {renew_api_status['status']} ({renew_api_status['body']})"
-                if renew_api_status["called"]
+                f"\nAPI响应：HTTP {api_tracker['status']} ({api_tracker['body']})"
+                if api_tracker["called"]
                 else "\nAPI响应：未捕获到后端续期请求"
             )
 

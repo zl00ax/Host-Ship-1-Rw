@@ -260,11 +260,9 @@ def first_visible(page, selectors):
     return None
 
 
-SUBMIT_SELECTORS = [
-    'button[type="submit"]',
-    'input[type="submit"]',
-    'button:has-text("Sign in")',
+LOGIN_SUBMIT_SELECTORS = [
     'button:has-text("Sign In")',
+    'button:has-text("Sign in")',
     'button:has-text("Login")',
     'button:has-text("Log in")',
     'button:has-text("Continue")',
@@ -273,10 +271,14 @@ SUBMIT_SELECTORS = [
 
 
 def find_login_submit_button(page):
-    """动态查找当前登录表单的主提交按钮（兼容验证前后按钮文字变化）"""
-    btn = first_visible(page, SUBMIT_SELECTORS)
+    """仅在登录页查找登录按钮，严格排除 Logout 和 Discord 按钮"""
+    if "/auth/login" not in page.url:
+        return None
+
+    btn = first_visible(page, LOGIN_SUBMIT_SELECTORS)
     if btn:
         return btn
+
     try:
         buttons = page.locator("button")
         count = buttons.count()
@@ -284,7 +286,7 @@ def find_login_submit_button(page):
             item = buttons.nth(i)
             if item.is_visible():
                 txt = (item.inner_text(timeout=1000) or "").strip().lower()
-                if "discord" not in txt:
+                if "discord" not in txt and "logout" not in txt and "log out" not in txt:
                     return item
     except Exception:
         pass
@@ -308,9 +310,9 @@ def has_turnstile_token(page):
 
 
 def is_submit_ready(page, fallback_submit=None):
-    """动态检查当前登录提交按钮是否已解除禁用且不再显示 security check"""
+    """动态检查当前提交按钮是否已解除禁用且不再显示 security check"""
     try:
-        submit = find_login_submit_button(page) or fallback_submit
+        submit = find_login_submit_button(page) if "/auth/login" in page.url else fallback_submit
         if not submit or not submit.is_visible():
             return False
 
@@ -318,7 +320,7 @@ def is_submit_ready(page, fallback_submit=None):
             return False
 
         btn_text = (submit.inner_text(timeout=1000) or "").strip().lower()
-        if "security check" in btn_text:
+        if "security check" in btn_text or "logout" in btn_text:
             return False
 
         return True
@@ -418,7 +420,8 @@ def click_turnstile_box(page, password_locator=None, submit_locator=None, attemp
     try:
         box = page.evaluate("""(minY) => {
             const els = document.querySelectorAll('.cf-turnstile, [data-sitekey], form div, [role="dialog"] div');
-            for (const el of els) {\n                const rect = el.getBoundingClientRect();
+            for (const el of els) {
+                const rect = el.getBoundingClientRect();
                 if (rect.y >= minY && rect.width >= 250 && rect.width <= 420 && rect.height >= 55 && rect.height <= 80) {
                     if (el.querySelectorAll('input:not([type="hidden"]), button, a').length === 0) {
                         return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
@@ -567,11 +570,10 @@ def human_type(page, locator, text):
     time.sleep(random.uniform(0.2, 0.4))
 
 
-def submit_login_form(page, pass_input):
+def submit_login_form(page):
     """
     验证通过后提交登录表单：
-    重新查找已激活的登录按钮（文字已从 Complete the security check 变为 Sign in / Login）并点击，
-    若 3 秒内未跳转则补充按 Enter 键与 JS 点击双保险。
+    仅点击一次 Sign In 按钮并等待页面自然跳转离开 /auth/login，绝不触发二次盲点（防止误点 Dashboard 的 Logout 按钮）。
     """
     time.sleep(0.5)
     active_btn = find_login_submit_button(page)
@@ -579,7 +581,7 @@ def submit_login_form(page, pass_input):
     if active_btn:
         try:
             btn_label = (active_btn.inner_text(timeout=1500) or "").strip()
-            log(f"🚀 正在提交登录 (按钮: {btn_label or 'Submit'})...")
+            log(f"🚀 正在提交登录 (按钮: {btn_label or 'Sign In'})...")
         except Exception:
             log("🚀 正在提交登录...")
 
@@ -598,26 +600,11 @@ def submit_login_form(page, pass_input):
                 active_btn.click(timeout=2500)
             except Exception:
                 pass
-    else:
-        log("🚀 正在通过回车提交登录...")
 
     leave_start = time.time()
-    fallback_triggered = False
     while time.time() - leave_start < 15:
         if "/auth/login" not in page.url:
             return True
-
-        if not fallback_triggered and (time.time() - leave_start) >= 3.0:
-            fallback_triggered = True
-            try:
-                btn_now = find_login_submit_button(page)
-                if btn_now:
-                    btn_now.evaluate("el => el.click()")
-                elif pass_input:
-                    pass_input.press("Enter")
-            except Exception:
-                pass
-
         time.sleep(0.5)
 
     return "/auth/login" not in page.url
@@ -676,7 +663,7 @@ def login_if_needed(page):
                 "登录按钮始终处于禁用状态 (Complete the security check)，未能通过 Cloudflare 安全验证"
             )
 
-        submit_login_form(page, pass_input)
+        submit_login_form(page)
 
     if not navigate_to_server_panel(page, timeout_sec=35):
         raise RuntimeError(f"登录后未能进入服务器控制面板页面 (当前 URL: {page.url})")

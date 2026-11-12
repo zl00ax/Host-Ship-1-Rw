@@ -30,7 +30,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          python -m playwright install --with-deps chromium
+          python -m patchright install --with-deps chrome
 
       - name: Setup optional VLESS/VMess/Trojan node
         env:

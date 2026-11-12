@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
+
 try:
     from patchright.sync_api import TimeoutError as PlaywrightTimeoutError
     from patchright.sync_api import sync_playwright
@@ -58,7 +59,6 @@ def log(msg):
 def server_id():
     if not SERVER_URL:
         return "未知"
-
     return SERVER_URL.rstrip("/").split("/")[-1]
 
 
@@ -66,7 +66,6 @@ def node_status(use_proxy=None):
     active = IS_PROXY if use_proxy is None else use_proxy
     if active:
         return "✅ 已启用"
-
     return "⚪ 未启用（直连）"
 
 
@@ -106,12 +105,9 @@ def beijing_now():
 
 def estimate_renew_date(status):
     days = get_days(status)
-
     if days is None:
         return None
-
     wait_days = days - 13 if days >= 14 else 0
-
     return (
         beijing_now().date()
         + timedelta(days=wait_days)
@@ -125,7 +121,6 @@ def tg(text):
 
     try:
         proxies = None
-
         if IS_PROXY:
             proxies = {
                 "http": PROXY_SERVER,
@@ -149,17 +144,11 @@ def tg(text):
             log("✅ Telegram 通知发送成功")
             return True
 
-        log(
-            "❌ Telegram 通知失败: "
-            + response.text
-        )
-
+        log("❌ Telegram 通知失败: " + response.text)
         return False
 
     except Exception as exc:
-        log(
-            f"❌ Telegram 通知异常: {exc}"
-        )
+        log(f"❌ Telegram 通知异常: {exc}")
         return False
 
 
@@ -167,7 +156,6 @@ def current_ip(use_proxy=None):
     active = IS_PROXY if use_proxy is None else use_proxy
     try:
         proxies = None
-
         if active:
             proxies = {
                 "http": PROXY_SERVER,
@@ -206,13 +194,9 @@ def build_check_message(status, ip, use_proxy, reason="未到续期时间（需�
     ]
 
     if days is not None:
-        lines.append(
-            f"⏱️ 剩余有效期：{status}"
-        )
+        lines.append(f"⏱️ 剩余有效期：{status}")
     else:
-        lines.append(
-            f"📅 面板状态：{status}"
-        )
+        lines.append(f"📅 面板状态：{status}")
 
     if renew_date is not None and days is not None and days >= 14:
         lines.append(
@@ -220,10 +204,7 @@ def build_check_message(status, ip, use_proxy, reason="未到续期时间（需�
             + renew_date.strftime("%Y/%m/%d")
         )
 
-    lines.append(
-        "⏰ 自动检查：每天 08:00（北京时间）"
-    )
-
+    lines.append("⏰ 自动检查：每天 08:00（北京时间）")
     return "\n".join(lines)
 
 
@@ -243,33 +224,21 @@ def build_success_message(before, after, ip, use_proxy):
     ]
 
     if before_days is not None:
-        lines.append(
-            f"📅 续期前：约 {before_days} 天 ({before})"
-        )
+        lines.append(f"📅 续期前：约 {before_days} 天 ({before})")
     else:
-        lines.append(
-            f"📅 续期前：{before}"
-        )
+        lines.append(f"📅 续期前：{before}")
 
     if after_days is not None:
-        lines.append(
-            f"✅ 续期后：约 {after_days} 天 ({after})"
-        )
+        lines.append(f"✅ 续期后：约 {after_days} 天 ({after})")
     else:
-        lines.append(
-            f"✅ 续期后：{after}"
-        )
+        lines.append(f"✅ 续期后：{after}")
 
-    lines.append(
-        "⏰ 自动检查：每天 08:00（北京时间）"
-    )
-
+    lines.append("⏰ 自动检查：每天 08:00（北京时间）")
     return "\n".join(lines)
 
 
 def build_error_message(title, reason, ip, use_proxy):
     now = beijing_now()
-
     return (
         f"{title}\n\n"
         f"🖥️ 服务器：#{server_id()}\n"
@@ -282,20 +251,12 @@ def build_error_message(title, reason, ip, use_proxy):
 
 def first_visible(page, selectors):
     for selector in selectors:
-        locator = page.locator(
-            selector
-        ).first
-
+        locator = page.locator(selector).first
         try:
-            if (
-                locator.count()
-                and locator.is_visible()
-            ):
+            if locator.count() and locator.is_visible():
                 return locator
-
         except Exception:
             pass
-
     return None
 
 
@@ -336,59 +297,96 @@ def is_submit_ready(page, submit):
         return False
 
 
-def human_mouse_click(page, x, y):
-    """使用纯物理鼠标轨迹点击目标坐标，模拟真人预热移动与微小抖动"""
-    jitter_x = x + random.uniform(-2.5, 2.5)
+def warmup_mouse(page):
+    """在页面加载初期生成自然鼠标移动事件，配合 Cloudflare jsd 静默脚本校验"""
+    try:
+        x1, y1 = random.uniform(280, 520), random.uniform(220, 380)
+        x2, y2 = random.uniform(550, 820), random.uniform(320, 520)
+        page.mouse.move(x1, y1, steps=random.randint(8, 14))
+        time.sleep(random.uniform(0.12, 0.25))
+        page.mouse.move(x2, y2, steps=random.randint(10, 18))
+    except Exception:
+        pass
+
+
+def human_mouse_click(page, x, y, start_x=None, start_y=None):
+    """使用纯物理鼠标轨迹点击目标坐标，模拟真人弧线移动与微小抖动"""
+    jitter_x = x + random.uniform(-2.0, 2.0)
     jitter_y = y + random.uniform(-2.0, 2.0)
 
-    # 先在页面安全空白区域做一次平滑移动，积累 mousemove 事件
-    mid_x = jitter_x + random.uniform(60, 160)
-    mid_y = jitter_y + random.uniform(-40, 40)
-    page.mouse.move(mid_x, mid_y, steps=random.randint(6, 12))
-    time.sleep(random.uniform(0.1, 0.22))
+    if start_x is None or start_y is None:
+        start_x = jitter_x + random.uniform(70, 150)
+        start_y = jitter_y + random.uniform(-45, 35)
 
-    # 移动到目标复选框中心
-    page.mouse.move(jitter_x, jitter_y, steps=random.randint(14, 25))
-    time.sleep(random.uniform(0.15, 0.3))
+    page.mouse.move(start_x, start_y, steps=random.randint(5, 10))
+    time.sleep(random.uniform(0.08, 0.16))
+
+    # 弧线中间过渡点
+    mid_x = (start_x + jitter_x) / 2 + random.uniform(-25, 25)
+    mid_y = (start_y + jitter_y) / 2 + random.uniform(-18, 18)
+    page.mouse.move(mid_x, mid_y, steps=random.randint(8, 14))
+    time.sleep(random.uniform(0.06, 0.14))
+
+    # 移动到目标复选框中心先悬停片刻再按下
+    page.mouse.move(jitter_x, jitter_y, steps=random.randint(12, 22))
+    time.sleep(random.uniform(0.18, 0.32))
     page.mouse.down()
-    time.sleep(random.uniform(0.07, 0.15))
+    time.sleep(random.uniform(0.08, 0.16))
     page.mouse.up()
 
 
-def click_turnstile_box(page, password_locator=None, submit_locator=None):
+def click_turnstile_box(page, password_locator=None, submit_locator=None, attempt=1):
     """
-    【核心原则】绝不调用 frame.locator() 进入 Turnstile iframe 内部！
-    只在主文档层通过外层 iframe/容器的 bounding_box 计算左侧复选框物理坐标并点击。
+    【核心原则】绝不查询或定位 iframe[src*="challenges.cloudflare.com"]！
+    避免触发 Cloudflare 对 Shadow DOM 内部 iframe 节点的探测陷阱。
+    仅通过主文档宿主容器、表单间距及原生键盘焦点 (Tab+Space) 触发。
     """
-    outer_selectors = [
-        'iframe[src*="challenges.cloudflare.com"]',
-        'iframe[src*="turnstile"]',
-        'iframe[title*="Cloudflare" i]',
-        'iframe[title*="widget" i]',
-        '.cf-turnstile',
-        '[data-sitekey]',
-        '[id*="turnstile" i]',
-        '[class*="turnstile" i]',
-    ]
-
-    for selector in outer_selectors:
+    start_x, start_y = None, None
+    if password_locator:
         try:
-            loc = page.locator(selector).first
-            if loc.count() and loc.is_visible():
-                box = loc.bounding_box()
-                if box and box["width"] >= 100 and box["height"] >= 35:
-                    target_x = box["x"] + 28
-                    target_y = box["y"] + (box["height"] / 2)
-                    human_mouse_click(page, target_x, target_y)
-                    log(f"🖱️ 已通过外层容器 ({selector}) 物理坐标点击 Turnstile: ({int(target_x)}, {int(target_y)})")
+            pw_box = password_locator.bounding_box()
+            if pw_box:
+                start_x = pw_box["x"] + pw_box["width"] / 2
+                start_y = pw_box["y"] + pw_box["height"] / 2
+        except Exception:
+            pass
+
+    # 第 2 次重试时，结合原生键盘 Tab + Space 触发（无需任何坐标或 DOM 查询）
+    if attempt == 2 and password_locator:
+        try:
+            log("⌨️ 尝试通过密码框原生焦点切换 (Tab + Space) 触发 Turnstile...")
+            password_locator.click()
+            time.sleep(random.uniform(0.2, 0.35))
+            page.keyboard.press("Tab")
+            time.sleep(random.uniform(0.35, 0.6))
+            page.keyboard.press("Space")
+            time.sleep(1.5)
+            if has_turnstile_token(page):
+                return True
+        except Exception:
+            pass
+
+    # 1. 优先通过密码框与提交按钮之间的几何间距计算坐标（零 Turnstile DOM 接触）
+    if password_locator and submit_locator:
+        try:
+            pw_box = password_locator.bounding_box()
+            sub_box = submit_locator.bounding_box()
+            if pw_box and sub_box:
+                pw_bottom = pw_box["y"] + pw_box["height"]
+                gap = sub_box["y"] - pw_bottom
+                if gap >= 45:
+                    target_x = sub_box["x"] + 30
+                    target_y = pw_bottom + (gap / 2)
+                    human_mouse_click(page, target_x, target_y, start_x, start_y)
+                    log(f"🖱️ 已通过表单几何间距物理坐标点击 Turnstile: ({int(target_x)}, {int(target_y)})")
                     return True
         except Exception:
             pass
 
-    # 如果外层 iframe 被挂载在宿主元素的 Shadow Root 内，通过主页面元素尺寸匹配定位
+    # 2. 通过主文档外层宿主 div 尺寸匹配定位（不接触任何 iframe 标签）
     try:
         box = page.evaluate("""() => {
-            const els = document.querySelectorAll('form div, [role="dialog"] div, body div');
+            const els = document.querySelectorAll('.cf-turnstile, [data-sitekey], form div, [role="dialog"] div, body div');
             for (const el of els) {
                 const rect = el.getBoundingClientRect();
                 if (rect.width >= 250 && rect.width <= 420 && rect.height >= 55 && rect.height <= 80) {
@@ -400,27 +398,31 @@ def click_turnstile_box(page, password_locator=None, submit_locator=None):
             return null;
         }""")
         if box:
-            target_x = box["x"] + 28
+            target_x = box["x"] + 30
             target_y = box["y"] + (box["height"] / 2)
-            human_mouse_click(page, target_x, target_y)
-            log(f"🖱️ 已通过外层尺寸匹配物理坐标点击 Turnstile: ({int(target_x)}, {int(target_y)})")
+            human_mouse_click(page, target_x, target_y, start_x, start_y)
+            log(f"🖱️ 已通过外层宿主容器物理坐标点击 Turnstile: ({int(target_x)}, {int(target_y)})")
             return True
     except Exception:
         pass
 
-    # 保底：通过密码框与提交按钮之间的空白间距计算坐标
-    if password_locator and submit_locator:
+    # 3. 保底：仅检查主文档宿主属性选择器
+    host_selectors = [
+        '.cf-turnstile',
+        '[data-sitekey]',
+        '[id*="turnstile" i]',
+        '[class*="turnstile" i]',
+    ]
+    for selector in host_selectors:
         try:
-            pw_box = password_locator.bounding_box()
-            sub_box = submit_locator.bounding_box()
-            if pw_box and sub_box:
-                pw_bottom = pw_box["y"] + pw_box["height"]
-                gap = sub_box["y"] - pw_bottom
-                if gap >= 45:
-                    target_x = sub_box["x"] + 28
-                    target_y = pw_bottom + (gap / 2)
-                    human_mouse_click(page, target_x, target_y)
-                    log(f"🖱️ 已通过密码框与提交按钮间距物理点击 Turnstile: ({int(target_x)}, {int(target_y)})")
+            loc = page.locator(selector).first
+            if loc.count() and loc.is_visible():
+                box = loc.bounding_box()
+                if box and box["width"] >= 100 and box["height"] >= 35:
+                    target_x = box["x"] + 30
+                    target_y = box["y"] + (box["height"] / 2)
+                    human_mouse_click(page, target_x, target_y, start_x, start_y)
+                    log(f"🖱️ 已通过宿主选择器 ({selector}) 物理坐标点击 Turnstile: ({int(target_x)}, {int(target_y)})")
                     return True
         except Exception:
             pass
@@ -432,9 +434,9 @@ def wait_and_solve_turnstile(
     page,
     submit,
     password_locator=None,
-    timeout_sec=45,
+    timeout_sec=50,
 ):
-    """等待安全验证完成，严格控制点击频次（最多点 2 次），绝不频繁连点打断验证"""
+    """等待安全验证完成，严格控制点击频次，结合物理点击与键盘触发"""
     start_time = time.time()
     last_click_time = 0.0
     click_attempts = 0
@@ -447,660 +449,328 @@ def wait_and_solve_turnstile(
         now = time.time()
         elapsed = now - start_time
 
-        # 先等 5 秒给 Turnstile 自动静默校验；若未过，第 5 秒点第 1 次，第 20 秒最多补点第 2 次
-        if elapsed >= 5.0 and (now - last_click_time) >= 15.0 and click_attempts < 2:
+        # 先等 6 秒给 Turnstile 自动静默校验；未通过则间隔 14 秒尝试（最多 3 次）
+        if elapsed >= 6.0 and (now - last_click_time) >= 14.0 and click_attempts < 3:
             click_attempts += 1
             last_click_time = now
-            log(f"⏳ 登录按钮仍禁用，尝试外层物理坐标点击安全验证 (第 {click_attempts} 次)...")
+            log(f"⏳ 登录按钮仍禁用，尝试触发安全验证 (第 {click_attempts} 次)...")
             click_turnstile_box(
                 page,
                 password_locator=password_locator,
                 submit_locator=submit,
+                attempt=click_attempts,
             )
 
-        page.wait_for_timeout(1000)
+        time.sleep(1.0)
 
     return is_submit_ready(page, submit)
 
 
-def wait_for_server_panel_loaded(page, timeout_sec=15):
-    """等待服务器详情页右侧状态卡片渲染完成"""
-    start_time = time.time()
-    while time.time() - start_time < timeout_sec:
+def wait_for_server_panel_loaded(page, timeout_sec=30):
+    start = time.time()
+    while time.time() - start < timeout_sec:
         try:
-            body_text = page.locator("body").inner_text()
-            if any(
-                kw in body_text.upper()
-                for kw in ["EXPIRES", "UPTIME", "CPU LOAD", "RENEW"]
+            body_text = page.locator("body").inner_text(timeout=3000)
+            if (
+                re.search(r"EXPIRES|Renewal|Server\s+Details|Console|Power", body_text, re.I)
+                and "/auth/login" not in page.url
             ):
-                page.wait_for_timeout(1500)
                 return True
         except Exception:
             pass
-        page.wait_for_timeout(1000)
+        time.sleep(1.0)
     return False
 
 
 def human_type(page, locator, text):
-    """模拟真人移动鼠标点击输入框并逐字输入"""
+    """使用带鼠标移动的真实点击聚焦，并以随机按键间隔输入文本"""
     try:
         box = locator.bounding_box()
         if box:
-            human_mouse_click(
-                page,
-                box["x"] + box["width"] * 0.3,
-                box["y"] + box["height"] * 0.5,
-            )
+            cx = box["x"] + box["width"] * random.uniform(0.3, 0.7)
+            cy = box["y"] + box["height"] * random.uniform(0.35, 0.65)
+            page.mouse.move(cx, cy, steps=random.randint(8, 15))
+            time.sleep(random.uniform(0.08, 0.18))
+            page.mouse.click(cx, cy)
         else:
             locator.click()
     except Exception:
         locator.click()
 
     time.sleep(random.uniform(0.15, 0.3))
-    try:
-        locator.fill("")
-        locator.press_sequentially(text, delay=random.randint(40, 85))
-    except Exception:
-        locator.fill(text)
+    page.keyboard.press("Control+A")
+    time.sleep(random.uniform(0.05, 0.12))
+    page.keyboard.press("Backspace")
+    time.sleep(random.uniform(0.1, 0.2))
+
+    for ch in text:
+        page.keyboard.type(ch, delay=random.randint(45, 115))
+    time.sleep(random.uniform(0.2, 0.4))
 
 
 def login_if_needed(page):
-    page.goto(
-        SERVER_URL,
-        wait_until="domcontentloaded",
-        timeout=60000,
-    )
+    """检查是否需要登录，如果需要则填写凭据并通过 Turnstile 验证"""
+    time.sleep(2.0)
+    warmup_mouse(page)
 
-    page.wait_for_timeout(4000)
+    user_selectors = [
+        'input[name="username"]',
+        'input[name="email"]',
+        'input[type="email"]',
+        'input[autocomplete="username"]',
+        'input[placeholder*="Email" i]',
+        'input[placeholder*="User" i]',
+        'input:not([type="hidden"]):not([type="password"])',
+    ]
+    pass_selectors = [
+        'input[name="password"]',
+        'input[type="password"]',
+        'input[autocomplete="current-password"]',
+    ]
+    submit_selectors = [
+        'button[type="submit"]',
+        'input[type="submit"]',
+        'button:has-text("Login")',
+        'button:has-text("Sign in")',
+        'button:has-text("Continue")',
+        'button:has-text("Complete the security check")',
+    ]
 
-    for _ in range(3):
-        title_text = (page.title() or "").lower()
-        body_lower = page.locator("body").inner_text().lower()
-        if (
-            "just a moment" in title_text
-            or "verify you are human" in body_lower
-        ):
-            log("🛡️ 检测到 Cloudflare 全屏拦截页，等待 4 秒后尝试外层物理点击...")
-            page.wait_for_timeout(4000)
-            click_turnstile_box(page)
-            page.wait_for_timeout(8000)
-        else:
-            break
+    user_input = first_visible(page, user_selectors)
+    pass_input = first_visible(page, pass_selectors)
 
-    body = page.locator(
-        "body"
-    ).inner_text().lower()
+    if not user_input or not pass_input:
+        if wait_for_server_panel_loaded(page, timeout_sec=8):
+            log("✅ 当前已处于登录状态")
+            return True
+        user_input = first_visible(page, user_selectors)
+        pass_input = first_visible(page, pass_selectors)
+        if not user_input or not pass_input:
+            return True
 
-    if (
-        "/server/" in page.url
-        and "password" not in body
-    ):
-        wait_for_server_panel_loaded(page)
-        return True
-
-    email = first_visible(
-        page,
-        [
-            'input[name="email"]',
-            'input[type="email"]',
-            'input[name="username"]',
-            'input[autocomplete="username"]',
-        ],
-    )
-
-    password = first_visible(
-        page,
-        [
-            'input[name="password"]',
-            'input[type="password"]',
-            'input[autocomplete="current-password"]',
-        ],
-    )
-
-    if not email or not password:
-        log(
-            "❌ 没找到登录框，"
-            f"当前页面: {page.url}"
-        )
-        return False
-
-    if (
-        not HOSTSHIP_LOGIN
-        or not HOSTSHIP_PASSWORD
-    ):
-        log(
-            "❌ 缺少 HOSTSHIP_LOGIN "
-            "/ HOSTSHIP_PASSWORD"
-        )
-        return False
+    if not HOSTSHIP_LOGIN or not HOSTSHIP_PASSWORD:
+        raise RuntimeError("未配置 HOSTSHIP_LOGIN 或 HOSTSHIP_PASSWORD 环境变量")
 
     log("🔐 正在填写登录信息...")
+    human_type(page, user_input, HOSTSHIP_LOGIN)
+    time.sleep(random.uniform(0.3, 0.6))
+    human_type(page, pass_input, HOSTSHIP_PASSWORD)
 
-    human_type(page, email, HOSTSHIP_LOGIN)
-    page.wait_for_timeout(500)
-    human_type(page, password, HOSTSHIP_PASSWORD)
-
-    submit = first_visible(
-        page,
-        [
-            'button[type="submit"]',
-            'button:has-text("Login")',
-            'button:has-text("Sign in")',
-            'button:has-text("Log in")',
-        ],
-    )
-
-    if not submit:
-        log("❌ 没找到登录按钮")
-        return False
+    submit_btn = first_visible(page, submit_selectors)
+    if not submit_btn:
+        raise RuntimeError("未找到登录提交按钮")
 
     if not wait_and_solve_turnstile(
         page,
-        submit,
-        password_locator=password,
-        timeout_sec=45,
+        submit_btn,
+        password_locator=pass_input,
+        timeout_sec=50,
     ):
-        btn_label = ""
-        try:
-            btn_label = submit.inner_text().strip()
-        except Exception:
-            pass
-        log(
-            "⚠️ 登录按钮始终处于禁用状态 "
-            f"({btn_label or 'disabled'})，未能通过 Cloudflare 安全验证"
+        raise RuntimeError(
+            "登录按钮始终处于禁用状态 (Complete the security check)，未能通过 Cloudflare 安全验证"
         )
-        return False
 
-    log("🚀 点击登录按钮...")
+    log("🚀 正在提交登录...")
     try:
-        submit.click(timeout=10000)
-    except PlaywrightTimeoutError:
-        log("❌ 点击登录按钮超时")
+        box = submit_btn.bounding_box()
+        if box:
+            human_mouse_click(
+                page,
+                box["x"] + box["width"] / 2,
+                box["y"] + box["height"] / 2,
+            )
+        else:
+            submit_btn.click()
+    except Exception:
+        submit_btn.click()
+
+    if not wait_for_server_panel_loaded(page, timeout_sec=35):
+        raise RuntimeError("登录后未能成功加载服务器控制面板页面")
+
+    log("✅ 登录成功，已进入服务器面板")
+    return True
+
+
+def is_renew_limit_reached(text):
+    if not text:
         return False
-
-    for _ in range(12):
-        page.wait_for_timeout(1500)
-        if "/auth/" not in page.url and "/login" not in page.url:
-            break
-
-    text = page.locator(
-        "body"
-    ).inner_text().lower()
-
-    challenge_words = [
-        "captcha",
-        "verify you are human",
-        "complete the security check",
-    ]
-
-    if (
-        "/server/" not in page.url
-        and any(word in text for word in challenge_words)
-    ):
-        log(
-            "⚠️ 检测到验证码/"
-            "安全验证未通过"
-        )
-        return False
-
-    if "/server/" not in page.url:
-        page.goto(
-            SERVER_URL,
-            wait_until="domcontentloaded",
-            timeout=60000,
-        )
-
-    wait_for_server_panel_loaded(page)
-    return "/server/" in page.url
-
-
-def is_renew_limit_reached(body_text):
-    """检测是否处于未满续期窗口状态（如 Maximum 14 days reached）"""
-    limit_patterns = [
-        r"Renew\s+Limit\s+Reached",
-        r"Maximum\s+\d+\s+days?\s+reached",
-        r"You\s+can\s+renew\s+again\s+tomorrow",
-        r"when\s+it\s+drops\s+below\s+\d+\s+days?",
-        r"cannot\s+be\s+renewed\s+yet",
+    patterns = [
         r"already\s+renewed",
+        r"cannot\s+renew\s+yet",
+        r"only\s+renew\s+when",
+        r"less\s+than\s+14\s+days",
+        r"wait\s+until",
+        r"not\s+eligible\s+for\s+renewal",
     ]
-    for pattern in limit_patterns:
-        if re.search(pattern, body_text, re.I):
+    for p in patterns:
+        if re.search(p, text, re.I):
             return True
     return False
 
 
 def get_renewal_text(page):
-    text = page.locator(
-        "body"
-    ).inner_text()
+    try:
+        body_text = page.locator("body").inner_text(timeout=5000)
+    except Exception:
+        return "未知状态"
 
-    expires_match = re.search(
-        r"EXPIRES\s+([A-Z0-9\s]+?)\s*\n+\s*(\d+\s*Days?)",
-        text,
+    match = re.search(
+        r"(\d+\s*Days?\s*\(EXPIRES[^\)]+\))",
+        body_text,
         re.I,
     )
-    if expires_match:
-        exp_date = expires_match.group(1).strip()
-        days_str = expires_match.group(2).strip()
-        return f"{days_str} (EXPIRES {exp_date})"
+    if match:
+        return re.sub(r"\s+", " ", match.group(1)).strip()
 
-    patterns = [
-        r"Renewal\s+in\s+\d+\s+Days?",
-        r"Renew\s+in\s+\d+\s+Days?",
-        r"\d+\s+Days?\s+until\s+renewal",
-    ]
+    for line in body_text.splitlines():
+        line_clean = line.strip()
+        if re.search(r"EXPIRES|\d+\s*Days?", line_clean, re.I) and len(line_clean) < 80:
+            return line_clean
 
-    for pattern in patterns:
-        match = re.search(
-            pattern,
-            text,
-            re.I,
-        )
-        if match:
-            return match.group(0)
-
-    max_match = re.search(
-        r"Maximum\s+\d+\s+days?\s+reached",
-        text,
-        re.I,
-    )
-    if max_match:
-        return max_match.group(0)
-
-    if re.search(
-        r"Renew\s+Limit\s+Reached",
-        text,
-        re.I,
-    ):
-        return "Renew Limit Reached"
-
-    return "未识别"
+    return "未知状态"
 
 
 def inspect_renew_elements(page):
-    """打印页面上所有包含 Renew 字样的可见元素详情"""
-    info_list = page.evaluate("""() => {
-        const results = [];
-        const all = document.querySelectorAll('button, a, [role="button"], div, span');
-        for (const el of all) {
-            const text = (el.innerText || '').trim().replace(/\\s+/g, ' ');
-            if (!text || !/renew/i.test(text) || text.length > 60) continue;
-            const rect = el.getBoundingClientRect();
-            if (rect.width === 0 || rect.height === 0) continue;
-            if (el.tagName === 'DIV' && el.querySelectorAll('button, a').length > 0) continue;
-            results.push({
-                tag: el.tagName.toLowerCase(),
-                text: text,
-                x: Math.round(rect.x),
-                y: Math.round(rect.y),
-                w: Math.round(rect.width),
-                h: Math.round(rect.height),
-                disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true',
-                href: el.getAttribute('href') || '',
-                className: (el.className && typeof el.className === 'string') ? el.className.slice(0, 80) : ''
-            });
-        }
-        return results;
-    }""")
-    log("🔍 页面上与 Renew 相关的元素列表：")
-    for idx, item in enumerate(info_list):
-        log(
-            f"   [{idx}] <{item['tag']}> text='{item['text']}' "
-            f"pos=({item['x']},{item['y']} {item['w']}x{item['h']}) "
-            f"disabled={item['disabled']} href='{item['href']}'"
-        )
-    return info_list
-
-
-def find_right_panel_renew_button(page):
-    """精准定位右侧状态栏（EXPIRES 卡片下方）的 Renew 按钮"""
-    inspect_renew_elements(page)
-
-    ignore_words = [
-        "upgrade",
-        "premium",
-        "slow server",
-        "no renewals",
-        "maximum",
-        "limit reached",
-        "never expire",
-    ]
-
-    candidates = page.locator("button, a, [role='button'], div")
-    best_match = None
-
     try:
-        count = candidates.count()
-        for i in range(count):
-            el = candidates.nth(i)
-            if not el.is_visible():
-                continue
-
-            raw_text = (el.inner_text() or "").strip()
-            clean_text = re.sub(r"\s+", " ", raw_text)
-            if not clean_text or len(clean_text) > 30:
-                continue
-
-            lower_text = clean_text.lower()
-            if any(w in lower_text for w in ignore_words):
-                continue
-
-            if not re.match(r"^renew(?:\s+now)?$", lower_text, re.I):
-                continue
-
-            box = el.bounding_box()
-            if not box:
-                continue
-
-            if box["x"] > 500 and 80 <= box["width"] <= 550 and 24 <= box["height"] <= 80:
-                tag_name = el.evaluate("el => el.tagName.toLowerCase()")
-                log(
-                    f"🎯 锁定右侧 Renew 按钮: <{tag_name}> '{clean_text}' "
-                    f"坐标=({int(box['x'])}, {int(box['y'])}, {int(box['width'])}x{int(box['height'])})"
-                )
-                if tag_name in ("button", "a"):
-                    return el
-                best_match = el
-    except Exception as exc:
-        log(f"⚠️ 扫描右侧按钮异常: {exc}")
-
-    if best_match is not None:
-        return best_match
-
-    buttons = page.locator("button")
-    try:
-        for i in range(buttons.count()):
-            btn = buttons.nth(i)
-            if not btn.is_visible():
-                continue
-            txt = re.sub(r"\s+", " ", (btn.inner_text() or "").strip()).lower()
-            if any(w in txt for w in ignore_words):
-                continue
-            if "renew" in txt:
-                box = btn.bounding_box()
-                if box and box["x"] > 300:
-                    return btn
-    except Exception:
-        pass
-
-    return None
-
-
-def trigger_click_all_ways(page, locator, desc="按钮"):
-    """使用真实鼠标移动点击 + Playwright click 确保触发事件"""
-    try:
-        locator.scroll_into_view_if_needed(timeout=5000)
-        page.wait_for_timeout(300)
-    except Exception:
-        pass
-
-    box = None
-    try:
-        box = locator.bounding_box()
-    except Exception:
-        pass
-
-    if box:
-        cx = box["x"] + box["width"] / 2
-        cy = box["y"] + box["height"] / 2
-        log(f"🖱️ 移动鼠标并点击 {desc} 中心坐标: ({int(cx)}, {int(cy)})")
-        human_mouse_click(page, cx, cy)
-        page.wait_for_timeout(500)
-
-    try:
-        locator.click(timeout=4000)
-    except Exception:
-        pass
-
-
-def dump_page_diff(before_lines, page):
-    """打印点击按钮后页面上新出现的文字"""
-    try:
-        current_text = page.locator("body").inner_text()
-        current_lines = [
-            line.strip()
-            for line in current_text.splitlines()
-            if line.strip()
-        ]
-        added = [
-            line for line in current_lines
-            if line not in before_lines and not line.startswith("[定时重启")
-        ]
-        if added:
-            log(f"📄 点击后页面新增文本: {added[:15]}")
-        else:
-            log("📄 点击后页面文本无明显新增")
-        return added
+        info = page.evaluate("""() => {
+            const results = [];
+            const els = document.querySelectorAll('button, a, [role="button"]');
+            for (const el of els) {
+                const txt = (el.innerText || el.textContent || '').trim().replace(/\\s+/g, ' ');
+                const rect = el.getBoundingClientRect();
+                if (rect.width > 0 && rect.height > 0 && /renew|extend|free/i.test(txt)) {
+                    results.push({
+                        tag: el.tagName,
+                        text: txt.slice(0, 60),
+                        disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true',
+                        x: Math.round(rect.x),
+                        y: Math.round(rect.y),
+                        w: Math.round(rect.width),
+                        h: Math.round(rect.height)
+                    });
+                }
+            }
+            return results;
+        }""")
+        return info or []
     except Exception:
         return []
 
 
-def handle_post_click_flow(page, before, right_renew_btn, api_tracker):
-    """处理点击右侧 Renew 后的完整交互"""
-    before_body = page.locator("body").inner_text()
-    before_lines = set(
-        line.strip() for line in before_body.splitlines() if line.strip()
-    )
-
-    trigger_click_all_ways(page, right_renew_btn, "右侧 Renew 主按钮")
-    page.wait_for_timeout(2500)
-
-    added_lines = dump_page_diff(before_lines, page)
-
-    if not added_lines and not api_tracker["called"]:
-        log("🔄 第一次点击未触发弹窗或 API，尝试通过 JS 触发按钮及父级点击事件...")
+def find_right_panel_renew_button(page):
+    selectors = [
+        'button:has-text("Renew")',
+        'button:has-text("RENEW")',
+        'button:has-text("Extend")',
+        'a:has-text("Renew")',
+        '[role="button"]:has-text("Renew")',
+    ]
+    for sel in selectors:
+        loc = page.locator(sel)
         try:
-            right_renew_btn.evaluate("""el => {
-                el.click();
-                if (el.parentElement) el.parentElement.click();
-                const btn = el.querySelector('button, a');
-                if (btn) btn.click();
-            }""")
+            count = loc.count()
+            for i in range(count):
+                item = loc.nth(i)
+                if item.is_visible():
+                    return item
         except Exception:
             pass
-        page.wait_for_timeout(2500)
-        added_lines = dump_page_diff(before_lines, page)
+    return None
 
-    body_now = page.locator("body").inner_text()
-    after_now = get_renewal_text(page)
-    if renewal_succeeded(before, after_now, body_now):
-        log("✅ 点击后已直接完成续期")
+
+def trigger_click_all_ways(page, btn):
+    try:
+        btn.scroll_into_view_if_needed(timeout=3000)
+    except Exception:
+        pass
+
+    try:
+        box = btn.bounding_box()
+        if box:
+            human_mouse_click(
+                page,
+                box["x"] + box["width"] / 2,
+                box["y"] + box["height"] / 2,
+            )
+            return True
+    except Exception:
+        pass
+
+    try:
+        btn.click(timeout=5000)
         return True
+    except Exception:
+        pass
 
-    for wait_round in range(2):
-        if click_turnstile_box(page):
-            log(f"⏳ 已点击续期阶段的 Turnstile 验证框 (第 {wait_round + 1} 次)，等待验证通过...")
-            page.wait_for_timeout(10000)
-        else:
-            break
-
-    inspect_renew_elements(page)
-
-    modal_selectors = [
-        '[role="dialog"] button',
-        '[class*="modal" i] button',
-        '[class*="dialog" i] button',
-        '.swal2-confirm',
-        'button:has-text("Renew now")',
-        'button:has-text("Renew Now")',
-        'button:has-text("Confirm")',
-        'button:has-text("Yes")',
-        'button:has-text("Continue")',
-        'button[type="submit"]',
-    ]
-
-    ignore_words = ["cancel", "close", "no", "upgrade", "premium", "dismissal"]
-
-    for _ in range(3):
-        for sel in modal_selectors:
-            try:
-                loc = page.locator(sel)
-                for i in range(loc.count()):
-                    btn = loc.nth(i)
-                    if not btn.is_visible():
-                        continue
-                    txt = re.sub(r"\s+", " ", (btn.inner_text() or "").strip())
-                    if not txt or any(w in txt.lower() for w in ignore_words):
-                        continue
-                    if btn.is_disabled():
-                        log(f"⏳ 发现弹窗按钮 [{txt}] 但处于禁用状态，尝试外层点击 Turnstile 解锁...")
-                        click_turnstile_box(page)
-                        page.wait_for_timeout(8000)
-                    if not btn.is_disabled():
-                        log(f"✅ 点击弹窗确认按钮: [{txt}]")
-                        trigger_click_all_ways(page, btn, f"弹窗确认按钮 ({txt})")
-                        page.wait_for_timeout(2500)
-                        dump_page_diff(before_lines, page)
-                        return True
-            except Exception:
-                pass
-
-        page.wait_for_timeout(2000)
-
-    if not api_tracker["called"]:
-        log("⚠️ 点击右侧 Renew 未触发任何后端请求，尝试查找左侧菜单 'Renew server' 或直接调用后端续期 API...")
-
-        try:
-            left_renew = page.locator("a, button, div, span").filter(
-                has_text=re.compile(r"^Renew\s+server$", re.I)
-            ).first
-            if left_renew.count() and left_renew.is_visible():
-                log("🧭 发现左侧边栏 'Renew server' 入口，正在点击进入...")
-                trigger_click_all_ways(page, left_renew, "左侧 Renew server 菜单")
-                page.wait_for_timeout(3000)
-                dump_page_diff(before_lines, page)
-                inspect_renew_elements(page)
-
-                if click_turnstile_box(page):
-                    page.wait_for_timeout(9000)
-
-                sub_btns = page.locator("button")
-                for i in range(sub_btns.count()):
-                    b = sub_btns.nth(i)
-                    if not b.is_visible() or b.is_disabled():
-                        continue
-                    t = re.sub(r"\s+", " ", (b.inner_text() or "").strip())
-                    if re.search(r"renew|confirm|extend", t, re.I) and not any(
-                        w in t.lower() for w in ignore_words
-                    ):
-                        log(f"🖱️ 在子界面中点击续期按钮: [{t}]")
-                        trigger_click_all_ways(page, b, f"子页面按钮 ({t})")
-                        page.wait_for_timeout(3000)
-                        break
-        except Exception as exc:
-            log(f"⚠️ 尝试左侧菜单异常: {exc}")
-
-    if not api_tracker["called"]:
-        srv_id = server_id()
-        log(f"📡 尝试通过浏览器会话直接调用后端续期接口 (Server ID: {srv_id})...")
-        api_results = page.evaluate("""async (srvId) => {
-            const csrfMeta = document.querySelector('meta[name="csrf-token"]');
-            const xsrfCookie = document.cookie.split('; ').find(row => row.startsWith('XSRF-TOKEN='));
-            const xsrfToken = xsrfCookie ? decodeURIComponent(xsrfCookie.split('=')[1]) : '';
-            const headers = {
-                'Accept': 'application/json, text/plain, */*',
-                'Content-Type': 'application/json',
-                'X-Requested-With': 'XMLHttpRequest'
-            };
-            if (csrfMeta && csrfMeta.content) headers['X-CSRF-TOKEN'] = csrfMeta.content;
-            if (xsrfToken) headers['X-XSRF-TOKEN'] = xsrfToken;
-
-            const endpoints = [
-                `/api/client/servers/${srvId}/renew`,
-                `/api/client/servers/${srvId}/renewal`,
-                `/api/client/store/renew/${srvId}`,
-            ];
-            const logs = [];
-            for (const ep of endpoints) {
-                try {
-                    const res = await fetch(ep, {
-                        method: 'POST',
-                        headers: headers,
-                        credentials: 'same-origin',
-                        body: JSON.stringify({})
-                    });
-                    const txt = await res.text();
-                    logs.push({ ep, status: res.status, body: txt.slice(0, 200) });
-                    if (res.status >= 200 && res.status < 300) break;
-                } catch (e) {
-                    logs.push({ ep, status: 0, body: String(e) });
-                }
-            }
-            return logs;
-        }""", srv_id)
-
-        for r in api_results:
-            log(f"   -> POST {r['ep']} => HTTP {r['status']} | {r['body']}")
-
-    return True
+    return False
 
 
-def renewal_succeeded(before, after, body_text):
-    text = body_text.lower()
-    success_words = [
-        "renewed successfully",
-        "renewal successful",
-        "successfully renewed",
-        "has been renewed",
-        "server renewed",
-        "renew limit reached",
-        "maximum 14 days reached",
-        "you can renew again",
-    ]
+def dump_page_diff(before_text, after_text):
+    before_lines = set(line.strip() for line in (before_text or "").splitlines() if line.strip())
+    after_lines = [line.strip() for line in (after_text or "").splitlines() if line.strip()]
+    added = [line for line in after_lines if line not in before_lines]
+    if added:
+        log("📄 页面新增内容: " + " | ".join(added[:6]))
 
-    if any(word in text for word in success_words):
-        return True
 
+def renewal_succeeded(before, after, page_text=""):
     before_days = get_days(before)
     after_days = get_days(after)
 
-    if (
-        before_days is not None
-        and after_days is not None
-        and after_days > before_days
-    ):
+    if before_days is not None and after_days is not None and after_days > before_days:
         return True
 
     before_exp = get_expire_date_str(before)
     after_exp = get_expire_date_str(after)
-    if (
-        before_exp
-        and after_exp
-        and before_exp != after_exp
-    ):
+    if before_exp and after_exp and before_exp != after_exp:
+        return True
+
+    if re.search(r" successfully\s+renewed|renewal\s+successful|server\s+has\s+been\s+renewed", page_text, re.I):
         return True
 
     return False
 
 
-def wait_for_renewal_result(page, before, api_renew_ok=False):
-    """轮询并重新回到服务器主页检查最新到期天数"""
-    after = get_renewal_text(page)
+def wait_for_renewal_result(page, before_status, timeout_sec=35):
+    start = time.time()
+    while time.time() - start < timeout_sec:
+        after_status = get_renewal_text(page)
+        try:
+            body_text = page.locator("body").inner_text(timeout=2000)
+        except Exception:
+            body_text = ""
 
-    for attempt in range(5):
-        if SERVER_URL not in page.url:
-            page.goto(SERVER_URL, wait_until="domcontentloaded", timeout=60000)
-            wait_for_server_panel_loaded(page)
+        if renewal_succeeded(before_status, after_status, body_text):
+            return True, after_status
 
-        body_text = page.locator("body").inner_text()
-        after = get_renewal_text(page)
+        time.sleep(1.5)
 
-        if renewal_succeeded(before, after, body_text):
-            return True, after
+    return False, get_renewal_text(page)
 
-        page.wait_for_timeout(2000)
 
-        if attempt in (1, 3):
-            log("🔄 刷新页面以获取最新到期状态...")
-            page.goto(SERVER_URL, wait_until="domcontentloaded", timeout=60000)
-            wait_for_server_panel_loaded(page)
+def handle_post_click_flow(page, before_status):
+    """处理点击续期按钮后可能弹出的确认弹窗或二次 Turnstile 验证"""
+    time.sleep(2.5)
 
-    if api_renew_ok:
-        after = get_renewal_text(page)
-        return True, after
+    modal_confirm_selectors = [
+        '[role="dialog"] button:has-text("Renew")',
+        '[role="dialog"] button:has-text("Confirm")',
+        '[role="dialog"] button:has-text("Continue")',
+        '[role="dialog"] button[type="submit"]',
+        '.modal button:has-text("Renew")',
+        '.modal button:has-text("Confirm")',
+    ]
 
-    return False, after
+    confirm_btn = first_visible(page, modal_confirm_selectors)
+    if confirm_btn:
+        log("🪟 检测到续期确认弹窗，正在处理弹窗内安全验证...")
+        wait_and_solve_turnstile(page, confirm_btn, timeout_sec=45)
+        trigger_click_all_ways(page, confirm_btn)
+    else:
+        # 即使没有单独确认按钮，也检查是否出现了内嵌 Turnstile
+        click_turnstile_box(page, attempt=1)
+
+    return wait_for_renewal_result(page, before_status, timeout_sec=35)
 
 
 def resolve_headless():
@@ -1111,255 +781,163 @@ def resolve_headless():
     return not bool(os.getenv("DISPLAY"))
 
 
-def run_attempt(use_proxy, is_final_attempt):
-    """
-    执行单次续期尝试。
-    返回值:
-      0 -> 成功或正常无需续期
-      1 -> 失败
-      2 -> 登录阶段被 Cloudflare 拦截（允许外层切换代理/直连重试）
-    """
+def run_attempt(use_proxy):
     ip = current_ip(use_proxy)
-    use_headless = resolve_headless()
-    engine_name = "Patchright" if USING_PATCHRIGHT else "Playwright"
+    headless = resolve_headless()
+    mode_str = "Headless" if headless else "Headed (XVFB/GUI)"
+    engine_str = "Patchright" if USING_PATCHRIGHT else "Playwright"
 
     log(f"🌐 节点状态：{node_status(use_proxy)}")
     log(f"📍 当前出口IP：{ip}")
-    log(
-        f"🖥️ 浏览器模式：{'Headless' if use_headless else 'Headed (XVFB/GUI)'} ({engine_name})"
-    )
+    log(f"🖥️ 浏览器模式：{mode_str} ({engine_str})")
 
-    user_data_dir = tempfile.mkdtemp(prefix="hostship_chrome_profile_")
+    user_data_dir = tempfile.mkdtemp(prefix="hostship_profile_")
 
     try:
         with sync_playwright() as p:
-            # 严格遵守 Patchright 反检测规范：
-            # 1. 使用 launch_persistent_context
-            # 2. 不注入自定义 user_agent 或任何 --disable-blink-features 参数
-            context_kwargs = {
+            launch_kwargs = {
                 "user_data_dir": user_data_dir,
-                "headless": use_headless,
-                "proxy": {"server": PROXY_SERVER} if use_proxy else None,
-                "viewport": {"width": 1440, "height": 1000},
-                "locale": "en-US",
+                "headless": headless,
+                "no_viewport": True,
+                "args": [
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--window-size=1440,1000",
+                ],
             }
+            if use_proxy:
+                launch_kwargs["proxy"] = {"server": PROXY_SERVER}
 
             try:
                 context = p.chromium.launch_persistent_context(
                     channel="chrome",
-                    **context_kwargs,
+                    **launch_kwargs,
                 )
             except Exception:
                 context = p.chromium.launch_persistent_context(
-                    **context_kwargs,
+                    **launch_kwargs,
                 )
 
             page = context.pages[0] if context.pages else context.new_page()
 
-            api_tracker = {"called": False, "ok": False, "status": None, "body": ""}
-
             def on_response(response):
                 try:
                     url = response.url
-                    method = response.request.method
-                    if any(ext in url for ext in (".js", ".css", ".png", ".woff", ".svg", "cloudflare")):
-                        return
-                    if method in ("POST", "PUT", "PATCH", "DELETE") or "renew" in url.lower():
-                        body_preview = ""
-                        try:
-                            body_preview = response.text()[:300].replace("\n", " ")
-                        except Exception:
-                            pass
-                        log(f"📡 网络响应 [{method}] HTTP {response.status} -> {url} | {body_preview}")
-                        if "renew" in url.lower():
-                            api_tracker["called"] = True
-                            api_tracker["status"] = response.status
-                            api_tracker["ok"] = 200 <= response.status < 300
-                            api_tracker["body"] = body_preview
+                    if (
+                        "host-ship.com" in url
+                        and response.request.method in ("POST", "PUT", "PATCH")
+                        and not any(ext in url for ext in (".js", ".css", ".png", ".woff"))
+                    ):
+                        log(f"📡 网络响应 [{response.request.method}] HTTP {response.status} -> {url} | ")
                 except Exception:
                     pass
 
             page.on("response", on_response)
 
+            page.goto(SERVER_URL, wait_until="domcontentloaded", timeout=60000)
             try:
-                if not login_if_needed(page):
-                    page.screenshot(
-                        path="hostship_login_fail.png",
-                        full_page=True,
-                    )
-                    if is_final_attempt:
-                        tg(
-                            build_error_message(
-                                "❌ Host-Ship 登录失败",
-                                "登录失败或遇到 Cloudflare 安全验证拦截",
-                                ip,
-                                use_proxy,
-                            )
-                        )
-                    return 2
+                page.bring_to_front()
+            except Exception:
+                pass
 
-                log("✅ 登录成功")
+            login_if_needed(page)
 
-                before = get_renewal_text(page)
-                log(f"📅 当前续期状态：{before}")
+            before_status = get_renewal_text(page)
+            days = get_days(before_status)
+            log(f"📊 当前服务器状态：{before_status}")
 
-                body = page.locator("body").inner_text()
-
-                if is_renew_limit_reached(body):
-                    log("⏳ 目前未到续期时间（Maximum 14 days reached），不进行操作")
-                    if MANUAL_RUN:
-                        tg(build_check_message(before, ip, use_proxy))
-                    return 0
-
-                button = find_right_panel_renew_button(page)
-
-                if not button:
-                    page.screenshot(
-                        path="hostship_no_renew_button.png",
-                        full_page=True,
-                    )
-                    tg(
-                        build_error_message(
-                            "⚠️ Host-Ship 需要检查",
-                            f"没有找到可用的 Renew 按钮；当前状态：{before}",
-                            ip,
-                            use_proxy,
-                        )
-                    )
-                    return 1
-
-                try:
-                    disabled = button.is_disabled() or (
-                        button.get_attribute("aria-disabled") == "true"
-                    )
-                except Exception:
-                    disabled = False
-
-                if disabled:
-                    log("⏳ Renew 按钮当前处于禁用状态（未到可续期冷却窗口）")
-                    if MANUAL_RUN:
-                        tg(
-                            build_check_message(
-                                before,
-                                ip,
-                                use_proxy,
-                                reason="Renew 按钮当前处于禁用/冷却状态",
-                            )
-                        )
-                    return 0
-
-                log("🔄 已定位右侧 Renew 按钮，开始执行续期流程...")
-
-                handle_post_click_flow(page, before, button, api_tracker)
-
-                success, after = wait_for_renewal_result(
-                    page,
-                    before,
-                    api_renew_ok=api_tracker["ok"],
-                )
-
-                if success:
-                    log(f"✅ 续期成功：{before} -> {after}")
-                    tg(build_success_message(before, after, ip, use_proxy))
-                    return 0
-
-                api_body_lower = (api_tracker.get("body") or "").lower()
-                if any(
-                    kw in api_body_lower
-                    for kw in ("limit", "maximum", "already", "wait", "cooldown", "hours", "days", "cannot")
-                ):
-                    log(f"⏳ 后端接口提示当前暂不可续期: {api_tracker['body']}")
-                    if MANUAL_RUN:
-                        tg(
-                            build_check_message(
-                                before,
-                                ip,
-                                use_proxy,
-                                reason=f"后端提示：{api_tracker['body']}",
-                            )
-                        )
-                    return 0
-
-                page.screenshot(
-                    path="hostship_renew_uncertain.png",
-                    full_page=True,
-                )
-
-                log("⚠️ 已点击续期，但无法确认结果")
-
-                extra_api_info = (
-                    f"\nAPI响应：HTTP {api_tracker['status']} ({api_tracker['body']})"
-                    if api_tracker["called"]
-                    else "\nAPI响应：未捕获到后端续期请求"
-                )
-
-                tg(
-                    build_error_message(
-                        "⚠️ Host-Ship 续期结果需要检查",
-                        f"续期前：{before}；续期后：{after}{extra_api_info}",
-                        ip,
-                        use_proxy,
-                    )
-                )
-                return 1
-
-            except Exception as exc:
-                log(f"❌ 运行异常：{exc}")
-                try:
-                    page.screenshot(
-                        path="hostship_error.png",
-                        full_page=True,
-                    )
-                except Exception:
-                    pass
-
-                if is_final_attempt:
-                    tg(
-                        build_error_message(
-                            "❌ Host-Ship 自动续期异常",
-                            str(exc),
-                            ip,
-                            use_proxy,
-                        )
-                    )
-                return 1
-
-            finally:
+            if days is not None and days >= 14 and not MANUAL_RUN:
+                log(f"⏳ 剩余有效期 {days} 天（需低于 14 天才可续期），本次仅检查")
+                msg = build_check_message(before_status, ip, use_proxy)
+                tg(msg)
                 context.close()
+                return True, None
+
+            renew_btn = find_right_panel_renew_button(page)
+            if not renew_btn:
+                inspect_renew_elements(page)
+                if days is not None and days >= 14:
+                    msg = build_check_message(before_status, ip, use_proxy)
+                    tg(msg)
+                    context.close()
+                    return True, None
+                raise RuntimeError("未能在面板中找到续期 (Renew) 按钮")
+
+            if renew_btn.is_disabled():
+                if days is not None and days >= 14:
+                    log("ℹ️ 续期按钮当前处于禁用状态（未到可续期时间）")
+                    msg = build_check_message(before_status, ip, use_proxy)
+                    tg(msg)
+                    context.close()
+                    return True, None
+
+            log("🖱️ 正在点击续期按钮...")
+            trigger_click_all_ways(page, renew_btn)
+
+            ok, after_status = handle_post_click_flow(page, before_status)
+            if ok:
+                log(f"🎉 续期成功！状态更新为：{after_status}")
+                msg = build_success_message(before_status, after_status, ip, use_proxy)
+                tg(msg)
+                context.close()
+                return True, None
+
+            try:
+                body_after = page.locator("body").inner_text(timeout=3000)
+            except Exception:
+                body_after = ""
+
+            if is_renew_limit_reached(body_after) or (days is not None and days >= 14):
+                log("ℹ️ 面板提示暂未达到可续期条件")
+                msg = build_check_message(before_status, ip, use_proxy)
+                tg(msg)
+                context.close()
+                return True, None
+
+            context.close()
+            raise RuntimeError(f"点击续期后状态未发生变化（当前状态：{after_status}）")
+
+    except Exception as exc:
+        err_msg = str(exc)
+        log(f"⚠️ {err_msg}")
+        return False, (err_msg, ip)
+
     finally:
         shutil.rmtree(user_data_dir, ignore_errors=True)
 
 
 def main():
-    if not SERVER_URL.startswith(
-        "https://panel.host-ship.com/server/"
-    ):
-        log("❌ SERVER_URL 不正确")
-        tg(
-            "❌ Host-Ship 配置错误\n"
-            "SERVER_URL 不是服务器详情页地址"
-        )
-        return 1
-
     log("======================================")
     log(" Host-Ship Free Auto Renew")
     log("======================================")
 
-    # 如果启用了代理节点，先用代理跑；若代理 IP 被 Cloudflare 死锁，自动回退直连再试一次
-    modes = [True, False] if IS_PROXY else [False]
+    if not SERVER_URL:
+        log("❌ 未配置 SERVER_URL 环境变量")
+        sys.exit(1)
 
-    for idx, use_proxy in enumerate(modes):
-        is_final = idx == len(modes) - 1
-        rc = run_attempt(use_proxy=use_proxy, is_final_attempt=is_final)
-        if rc == 0:
-            return 0
-        if rc == 2 and not is_final:
-            log("🔄 当前代理节点 IP 疑似被 Cloudflare 标记拦截，正在自动切换为直连模式重试...")
-            continue
-        return 1
+    ok, err_info = run_attempt(IS_PROXY)
+    if ok:
+        sys.exit(0)
 
-    return 1
+    # 如果启用了代理且因为 Cloudflare 验证被拦截，自动回退直连重试一次
+    if IS_PROXY:
+        log("🔄 当前代理节点 IP 疑似被 Cloudflare 标记拦截，正在自动切换为直连模式重试...")
+        ok_direct, err_info_direct = run_attempt(False)
+        if ok_direct:
+            sys.exit(0)
+        err_info = err_info_direct
+
+    reason, ip = err_info if err_info else ("未知错误", "未知")
+    msg = build_error_message(
+        "❌ Host-Ship 自动续期失败",
+        reason,
+        ip,
+        False if IS_PROXY else IS_PROXY,
+    )
+    tg(msg)
+    sys.exit(1)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

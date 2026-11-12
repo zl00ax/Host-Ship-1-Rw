@@ -75,11 +75,11 @@ def get_days(text):
 
     patterns = [
         r"(\d+)\s*Days?\s*\(EXPIRES",
-        r"EXPIRES[^\n\d]*\n\s*(\d+)\s*Days?",
+        r"EXPIRES[^\n\d]*\n?\s*(\d+)\s*Days?",
         r"Renewal\s+in\s+(\d+)\s*Days?",
         r"Renew\s+in\s+(\d+)\s*Days?",
         r"(\d+)\s*Days?\s+until\s+renewal",
-        r"^(\d+)\s*Days?\b",
+        r"\b(\d+)\s*Days?\b",
     ]
 
     for pattern in patterns:
@@ -93,7 +93,7 @@ def get_days(text):
 def get_expire_date_str(text):
     if not text:
         return None
-    match = re.search(r"EXPIRES\s+([A-Z0-9\s]+?)[\)\n]", text + "\n", re.I)
+    match = re.search(r"EXPIRES\s+([A-Z0-9\s]+?)[\)\n\-]", text + "\n", re.I)
     if match:
         return match.group(1).strip().upper()
     return None
@@ -321,13 +321,11 @@ def human_mouse_click(page, x, y, start_x=None, start_y=None):
     page.mouse.move(start_x, start_y, steps=random.randint(5, 10))
     time.sleep(random.uniform(0.08, 0.16))
 
-    # 弧线中间过渡点
     mid_x = (start_x + jitter_x) / 2 + random.uniform(-25, 25)
     mid_y = (start_y + jitter_y) / 2 + random.uniform(-18, 18)
     page.mouse.move(mid_x, mid_y, steps=random.randint(8, 14))
     time.sleep(random.uniform(0.06, 0.14))
 
-    # 移动到目标复选框中心先悬停片刻再按下
     page.mouse.move(jitter_x, jitter_y, steps=random.randint(12, 22))
     time.sleep(random.uniform(0.18, 0.32))
     page.mouse.down()
@@ -338,8 +336,7 @@ def human_mouse_click(page, x, y, start_x=None, start_y=None):
 def click_turnstile_box(page, password_locator=None, submit_locator=None, attempt=1):
     """
     【核心原则】绝不查询或定位 iframe[src*="challenges.cloudflare.com"]！
-    避免触发 Cloudflare 对 Shadow DOM 内部 iframe 节点的探测陷阱。
-    仅通过主文档宿主容器、表单间距及原生键盘焦点 (Tab+Space) 触发。
+    结合外层宿主容器尺寸、提交按钮上方偏移坐标以及原生 Tab 焦点（自动跳过 Forgot password? 链接）触发。
     """
     start_x, start_y = None, None
     if password_locator:
@@ -351,14 +348,21 @@ def click_turnstile_box(page, password_locator=None, submit_locator=None, attemp
         except Exception:
             pass
 
-    # 第 2 次重试时，结合原生键盘 Tab + Space 触发（无需任何坐标或 DOM 查询）
+    # 第 2 次尝试时，优先使用密码框原生焦点切换 (Tab 跳过 Forgot password? -> Space)
     if attempt == 2 and password_locator:
         try:
             log("⌨️ 尝试通过密码框原生焦点切换 (Tab + Space) 触发 Turnstile...")
             password_locator.click()
             time.sleep(random.uniform(0.2, 0.35))
             page.keyboard.press("Tab")
-            time.sleep(random.uniform(0.35, 0.6))
+            time.sleep(random.uniform(0.25, 0.4))
+            # 如果焦点停在 "Forgot password?" 链接 (<a>) 上，再按一次 Tab 进入 Turnstile
+            is_link = page.evaluate(
+                "() => document.activeElement && document.activeElement.tagName === 'A'"
+            )
+            if is_link:
+                page.keyboard.press("Tab")
+                time.sleep(random.uniform(0.3, 0.5))
             page.keyboard.press("Space")
             time.sleep(1.5)
             if has_turnstile_token(page):
@@ -366,31 +370,14 @@ def click_turnstile_box(page, password_locator=None, submit_locator=None, attemp
         except Exception:
             pass
 
-    # 1. 优先通过密码框与提交按钮之间的几何间距计算坐标（零 Turnstile DOM 接触）
-    if password_locator and submit_locator:
-        try:
-            pw_box = password_locator.bounding_box()
-            sub_box = submit_locator.bounding_box()
-            if pw_box and sub_box:
-                pw_bottom = pw_box["y"] + pw_box["height"]
-                gap = sub_box["y"] - pw_bottom
-                if gap >= 45:
-                    target_x = sub_box["x"] + 30
-                    target_y = pw_bottom + (gap / 2)
-                    human_mouse_click(page, target_x, target_y, start_x, start_y)
-                    log(f"🖱️ 已通过表单几何间距物理坐标点击 Turnstile: ({int(target_x)}, {int(target_y)})")
-                    return True
-        except Exception:
-            pass
-
-    # 2. 通过主文档外层宿主 div 尺寸匹配定位（不接触任何 iframe 标签）
+    # 1. 优先通过主文档外层宿主 div 尺寸匹配定位（约 300x65，不接触任何 iframe 标签）
     try:
         box = page.evaluate("""() => {
             const els = document.querySelectorAll('.cf-turnstile, [data-sitekey], form div, [role="dialog"] div, body div');
             for (const el of els) {
                 const rect = el.getBoundingClientRect();
                 if (rect.width >= 250 && rect.width <= 420 && rect.height >= 55 && rect.height <= 80) {
-                    if (el.querySelectorAll('input:not([type="hidden"]), button').length === 0) {
+                    if (el.querySelectorAll('input:not([type="hidden"]), button, a').length === 0) {
                         return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
                     }
                 }
@@ -406,7 +393,20 @@ def click_turnstile_box(page, password_locator=None, submit_locator=None, attemp
     except Exception:
         pass
 
-    # 3. 保底：仅检查主文档宿主属性选择器
+    # 2. 通过提交按钮正上方偏移计算坐标（截图 1 中 Turnstile 紧贴在提交按钮上方约 48px 处）
+    if submit_locator:
+        try:
+            sub_box = submit_locator.bounding_box()
+            if sub_box:
+                target_x = sub_box["x"] + 30
+                target_y = sub_box["y"] - 48
+                human_mouse_click(page, target_x, target_y, start_x, start_y)
+                log(f"🖱️ 已通过提交按钮上方偏移物理坐标点击 Turnstile: ({int(target_x)}, {int(target_y)})")
+                return True
+        except Exception:
+            pass
+
+    # 3. 保底：检查主文档宿主属性选择器
     host_selectors = [
         '.cf-turnstile',
         '[data-sitekey]',
@@ -449,8 +449,8 @@ def wait_and_solve_turnstile(
         now = time.time()
         elapsed = now - start_time
 
-        # 先等 6 秒给 Turnstile 自动静默校验；未通过则间隔 14 秒尝试（最多 3 次）
-        if elapsed >= 6.0 and (now - last_click_time) >= 14.0 and click_attempts < 3:
+        # 先等 6 秒给 Turnstile 自动静默校验；未通过则间隔 13 秒尝试（最多 3 次）
+        if elapsed >= 6.0 and (now - last_click_time) >= 13.0 and click_attempts < 3:
             click_attempts += 1
             last_click_time = now
             log(f"⏳ 登录按钮仍禁用，尝试触发安全验证 (第 {click_attempts} 次)...")
@@ -466,20 +466,74 @@ def wait_and_solve_turnstile(
     return is_submit_ready(page, submit)
 
 
-def wait_for_server_panel_loaded(page, timeout_sec=30):
-    start = time.time()
-    while time.time() - start < timeout_sec:
-        try:
-            body_text = page.locator("body").inner_text(timeout=3000)
-            if (
-                re.search(r"EXPIRES|Renewal|Server\s+Details|Console|Power", body_text, re.I)
-                and "/auth/login" not in page.url
-            ):
-                return True
-        except Exception:
-            pass
-        time.sleep(1.0)
+def is_on_server_detail_page(page):
+    """严格判断当前是否已经处于具体服务器控制面板页（截图 3），而非 Dashboard 主页（截图 2）"""
+    try:
+        url = page.url
+        if "/auth/login" in url:
+            return False
+
+        body_text = page.locator("body").inner_text(timeout=3000)
+        # 必须包含服务器详情页右侧栏特有指标：EXPIRES / UPTIME / CPU LOAD / DISK USAGE
+        if re.search(r"EXPIRES\s+[0-9A-Z]+|UPTIME|CPU\s+LOAD|DISK\s+USAGE", body_text, re.I):
+            return True
+    except Exception:
+        pass
     return False
+
+
+def navigate_to_server_panel(page, timeout_sec=35):
+    """
+    如果登录后停留在 Dashboard 主页（截图 2），自动点击 MANAGE SERVER 或跳转到 SERVER_URL 进入服务器详情页（截图 3）
+    """
+    start = time.time()
+    sid = server_id()
+
+    while time.time() - start < timeout_sec:
+        if is_on_server_detail_page(page):
+            return True
+
+        url = page.url
+        if "/auth/login" not in url:
+            # 1. 尝试在 Dashboard 页面点击 MANAGE SERVER 按钮或对应服务器链接（模拟真人操作）
+            manage_selectors = [
+                f'a[href*="{sid}"]',
+                'a:has-text("MANAGE SERVER")',
+                'button:has-text("MANAGE SERVER")',
+                '[role="button"]:has-text("MANAGE SERVER")',
+                'text="MANAGE SERVER"',
+            ]
+            clicked = False
+            for sel in manage_selectors:
+                try:
+                    loc = page.locator(sel).first
+                    if loc.count() and loc.is_visible():
+                        log("🖱️ 当前位于 Dashboard 主页，正在点击 MANAGE SERVER 进入服务器面板...")
+                        trigger_click_all_ways(page, loc)
+                        clicked = True
+                        break
+                except Exception:
+                    pass
+
+            if clicked:
+                time.sleep(3.0)
+                if is_on_server_detail_page(page):
+                    return True
+
+            # 2. 如果未找到按钮或点击后仍未进入，直接访问 SERVER_URL
+            if SERVER_URL and sid not in page.url:
+                log(f"🔗 正在直接跳转到服务器控制面板: {SERVER_URL}")
+                try:
+                    page.goto(SERVER_URL, wait_until="domcontentloaded", timeout=30000)
+                except Exception:
+                    pass
+                time.sleep(2.5)
+                if is_on_server_detail_page(page):
+                    return True
+
+        time.sleep(1.0)
+
+    return is_on_server_detail_page(page)
 
 
 def human_type(page, locator, text):
@@ -509,7 +563,7 @@ def human_type(page, locator, text):
 
 
 def login_if_needed(page):
-    """检查是否需要登录，如果需要则填写凭据并通过 Turnstile 验证"""
+    """检查是否需要登录，如果需要则填写凭据、通过 Turnstile 验证，并进入目标服务器详情页"""
     time.sleep(2.0)
     warmup_mouse(page)
 
@@ -540,52 +594,58 @@ def login_if_needed(page):
     pass_input = first_visible(page, pass_selectors)
 
     if not user_input or not pass_input:
-        if wait_for_server_panel_loaded(page, timeout_sec=8):
-            log("✅ 当前已处于登录状态")
+        if navigate_to_server_panel(page, timeout_sec=10):
+            log("✅ 当前已处于登录状态并已进入服务器面板")
             return True
         user_input = first_visible(page, user_selectors)
         pass_input = first_visible(page, pass_selectors)
-        if not user_input or not pass_input:
-            return True
 
-    if not HOSTSHIP_LOGIN or not HOSTSHIP_PASSWORD:
-        raise RuntimeError("未配置 HOSTSHIP_LOGIN 或 HOSTSHIP_PASSWORD 环境变量")
+    if user_input and pass_input:
+        if not HOSTSHIP_LOGIN or not HOSTSHIP_PASSWORD:
+            raise RuntimeError("未配置 HOSTSHIP_LOGIN 或 HOSTSHIP_PASSWORD 环境变量")
 
-    log("🔐 正在填写登录信息...")
-    human_type(page, user_input, HOSTSHIP_LOGIN)
-    time.sleep(random.uniform(0.3, 0.6))
-    human_type(page, pass_input, HOSTSHIP_PASSWORD)
+        log("🔐 正在填写登录信息...")
+        human_type(page, user_input, HOSTSHIP_LOGIN)
+        time.sleep(random.uniform(0.3, 0.6))
+        human_type(page, pass_input, HOSTSHIP_PASSWORD)
 
-    submit_btn = first_visible(page, submit_selectors)
-    if not submit_btn:
-        raise RuntimeError("未找到登录提交按钮")
+        submit_btn = first_visible(page, submit_selectors)
+        if not submit_btn:
+            raise RuntimeError("未找到登录提交按钮")
 
-    if not wait_and_solve_turnstile(
-        page,
-        submit_btn,
-        password_locator=pass_input,
-        timeout_sec=50,
-    ):
-        raise RuntimeError(
-            "登录按钮始终处于禁用状态 (Complete the security check)，未能通过 Cloudflare 安全验证"
-        )
-
-    log("🚀 正在提交登录...")
-    try:
-        box = submit_btn.bounding_box()
-        if box:
-            human_mouse_click(
-                page,
-                box["x"] + box["width"] / 2,
-                box["y"] + box["height"] / 2,
+        if not wait_and_solve_turnstile(
+            page,
+            submit_btn,
+            password_locator=pass_input,
+            timeout_sec=50,
+        ):
+            raise RuntimeError(
+                "登录按钮始终处于禁用状态 (Complete the security check)，未能通过 Cloudflare 安全验证"
             )
-        else:
-            submit_btn.click()
-    except Exception:
-        submit_btn.click()
 
-    if not wait_for_server_panel_loaded(page, timeout_sec=35):
-        raise RuntimeError("登录后未能成功加载服务器控制面板页面")
+        log("🚀 正在提交登录...")
+        try:
+            box = submit_btn.bounding_box()
+            if box:
+                human_mouse_click(
+                    page,
+                    box["x"] + box["width"] / 2,
+                    box["y"] + box["height"] / 2,
+                )
+            else:
+                submit_btn.click()
+        except Exception:
+            submit_btn.click()
+
+        # 等待离开登录页
+        leave_start = time.time()
+        while time.time() - leave_start < 15:
+            if "/auth/login" not in page.url:
+                break
+            time.sleep(0.5)
+
+    if not navigate_to_server_panel(page, timeout_sec=35):
+        raise RuntimeError(f"登录后未能进入服务器控制面板页面 (当前 URL: {page.url})")
 
     log("✅ 登录成功，已进入服务器面板")
     return True
@@ -609,22 +669,48 @@ def is_renew_limit_reached(text):
 
 
 def get_renewal_text(page):
+    """
+    精准提取截图 3 右下角到期卡片信息：
+    支持：
+      EXPIRES 18 NOV
+      6 Days
+    并统一格式化为：'6 Days (EXPIRES 18 NOV)'
+    """
     try:
         body_text = page.locator("body").inner_text(timeout=5000)
     except Exception:
         return "未知状态"
 
-    match = re.search(
+    # 1. 匹配截图 3 格式：第一行 EXPIRES 18 NOV，第二行 6 Days
+    match_two_line = re.search(
+        r"EXPIRES\s+([A-Z0-9 ]+?)\s*\n+\s*(\d+\s*Days?)",
+        body_text,
+        re.I,
+    )
+    if match_two_line:
+        exp_str = re.sub(r"\s+", " ", match_two_line.group(1)).strip().upper()
+        days_str = re.sub(r"\s+", " ", match_two_line.group(2)).strip()
+        return f"{days_str} (EXPIRES {exp_str})"
+
+    # 2. 匹配单行格式：6 Days (EXPIRES 18 NOV)
+    match_inline = re.search(
         r"(\d+\s*Days?\s*\(EXPIRES[^\)]+\))",
         body_text,
         re.I,
     )
-    if match:
-        return re.sub(r"\s+", " ", match.group(1)).strip()
+    if match_inline:
+        return re.sub(r"\s+", " ", match_inline.group(1)).strip()
 
-    for line in body_text.splitlines():
-        line_clean = line.strip()
-        if re.search(r"EXPIRES|\d+\s*Days?", line_clean, re.I) and len(line_clean) < 80:
+    # 3. 逐行兜底查找
+    lines = [line.strip() for line in body_text.splitlines() if line.strip()]
+    for idx, line_clean in enumerate(lines):
+        if re.search(r"^EXPIRES\b", line_clean, re.I):
+            if idx + 1 < len(lines) and re.search(r"\d+\s*Days?", lines[idx + 1], re.I):
+                return f"{lines[idx + 1]} ({line_clean})"
+            return line_clean
+
+    for line_clean in lines:
+        if re.search(r"\d+\s*Days?", line_clean, re.I) and len(line_clean) < 80:
             return line_clean
 
     return "未知状态"
@@ -705,14 +791,6 @@ def trigger_click_all_ways(page, btn):
     return False
 
 
-def dump_page_diff(before_text, after_text):
-    before_lines = set(line.strip() for line in (before_text or "").splitlines() if line.strip())
-    after_lines = [line.strip() for line in (after_text or "").splitlines() if line.strip()]
-    added = [line for line in after_lines if line not in before_lines]
-    if added:
-        log("📄 页面新增内容: " + " | ".join(added[:6]))
-
-
 def renewal_succeeded(before, after, page_text=""):
     before_days = get_days(before)
     after_days = get_days(after)
@@ -725,7 +803,11 @@ def renewal_succeeded(before, after, page_text=""):
     if before_exp and after_exp and before_exp != after_exp:
         return True
 
-    if re.search(r" successfully\s+renewed|renewal\s+successful|server\s+has\s+been\s+renewed", page_text, re.I):
+    if re.search(
+        r"successfully\s+renewed|renewal\s+successful|server\s+has\s+been\s+renewed|renewed\s+successfully",
+        page_text,
+        re.I,
+    ):
         return True
 
     return False
@@ -749,13 +831,23 @@ def wait_for_renewal_result(page, before_status, timeout_sec=35):
 
 
 def handle_post_click_flow(page, before_status):
-    """处理点击续期按钮后可能弹出的确认弹窗或二次 Turnstile 验证"""
+    """处理点击续期按钮后可能弹出的确认弹窗、二次 Turnstile 验证或直接刷新结果"""
     time.sleep(2.5)
+
+    # 先检查是否点击后已直接完成续期
+    after_now = get_renewal_text(page)
+    try:
+        body_now = page.locator("body").inner_text(timeout=2000)
+    except Exception:
+        body_now = ""
+    if renewal_succeeded(before_status, after_now, body_now):
+        return True, after_now
 
     modal_confirm_selectors = [
         '[role="dialog"] button:has-text("Renew")',
         '[role="dialog"] button:has-text("Confirm")',
         '[role="dialog"] button:has-text("Continue")',
+        '[role="dialog"] button:has-text("Complete the security check")',
         '[role="dialog"] button[type="submit"]',
         '.modal button:has-text("Renew")',
         '.modal button:has-text("Confirm")',
@@ -767,7 +859,7 @@ def handle_post_click_flow(page, before_status):
         wait_and_solve_turnstile(page, confirm_btn, timeout_sec=45)
         trigger_click_all_ways(page, confirm_btn)
     else:
-        # 即使没有单独确认按钮，也检查是否出现了内嵌 Turnstile
+        # 检查页面上是否直接出现了内嵌 Turnstile
         click_turnstile_box(page, attempt=1)
 
     return wait_for_renewal_result(page, before_status, timeout_sec=35)
@@ -920,9 +1012,8 @@ def main():
     if ok:
         sys.exit(0)
 
-    # 如果启用了代理且因为 Cloudflare 验证被拦截，自动回退直连重试一次
     if IS_PROXY:
-        log("🔄 当前代理节点 IP 疑似被 Cloudflare 标记拦截，正在自动切换为直连模式重试...")
+        log("🔄 当前代理节点尝试未完成，正在自动切换为直连模式重试...")
         ok_direct, err_info_direct = run_attempt(False)
         if ok_direct:
             sys.exit(0)

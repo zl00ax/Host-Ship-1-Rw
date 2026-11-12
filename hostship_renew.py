@@ -260,7 +260,7 @@ def first_visible(page, selectors):
     return None
 
 
- SUBMIT_SELECTORS = [
+SUBMIT_SELECTORS = [
     'button[type="submit"]',
     'input[type="submit"]',
     'button:has-text("Sign in")',
@@ -278,7 +278,6 @@ def find_login_submit_button(page):
     if btn:
         return btn
     try:
-        # 兜底：查找密码框所在容器内非 Discord 的第一个 button
         buttons = page.locator("button")
         count = buttons.count()
         for i in range(count):
@@ -390,7 +389,6 @@ def click_turnstile_box(page, password_locator=None, submit_locator=None, attemp
             time.sleep(random.uniform(0.2, 0.35))
             page.keyboard.press("Tab")
             time.sleep(random.uniform(0.25, 0.4))
-            # 如果焦点停在 "Forgot password?" 链接 (<a>) 上，再按一次 Tab 进入 Turnstile
             is_link = page.evaluate(
                 "() => document.activeElement && document.activeElement.tagName === 'A'"
             )
@@ -420,8 +418,7 @@ def click_turnstile_box(page, password_locator=None, submit_locator=None, attemp
     try:
         box = page.evaluate("""(minY) => {
             const els = document.querySelectorAll('.cf-turnstile, [data-sitekey], form div, [role="dialog"] div');
-            for (const el of els) {
-                const rect = el.getBoundingClientRect();
+            for (const el of els) {\n                const rect = el.getBoundingClientRect();
                 if (rect.y >= minY && rect.width >= 250 && rect.width <= 420 && rect.height >= 55 && rect.height <= 80) {
                     if (el.querySelectorAll('input:not([type="hidden"]), button, a').length === 0) {
                         return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
@@ -461,7 +458,6 @@ def wait_and_solve_turnstile(
         now = time.time()
         elapsed = now - start_time
 
-        # 先等 5 秒给 Turnstile 自动静默校验；未通过则每 11 秒尝试一次（最多 3 次）
         if elapsed >= 5.0 and (now - last_click_time) >= 11.0 and click_attempts < 3:
             click_attempts += 1
             last_click_time = now
@@ -605,7 +601,6 @@ def submit_login_form(page, pass_input):
     else:
         log("🚀 正在通过回车提交登录...")
 
-    # 等待离开登录页；如果 3 秒后仍在 /auth/login，执行 Enter + JS 点击兜底
     leave_start = time.time()
     fallback_triggered = False
     while time.time() - leave_start < 15:

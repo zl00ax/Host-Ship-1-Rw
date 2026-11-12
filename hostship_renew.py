@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os
+import random
 import re
 import sys
 import time
@@ -9,8 +10,14 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-from playwright.sync_api import sync_playwright
+try:
+    from patchright.sync_api import TimeoutError as PlaywrightTimeoutError
+    from patchright.sync_api import sync_playwright
+    USING_PATCHRIGHT = True
+except ImportError:
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+    from playwright.sync_api import sync_playwright
+    USING_PATCHRIGHT = False
 
 
 SERVER_URL = os.getenv("SERVER_URL", "").strip()
@@ -37,24 +44,6 @@ HEADLESS_MODE = os.getenv(
 ).strip().lower()
 
 BJ_TZ = ZoneInfo("Asia/Shanghai")
-
-STEALTH_INIT_SCRIPT = """
-Object.defineProperty(navigator, 'webdriver', {
-    get: () => undefined
-});
-window.chrome = window.chrome || {
-    runtime: {},
-    loadTimes: function() {},
-    csi: function() {},
-    app: {}
-};
-Object.defineProperty(navigator, 'languages', {
-    get: () => ['en-US', 'en']
-});
-Object.defineProperty(navigator, 'plugins', {
-    get: () => [1, 2, 3, 4, 5]
-});
-"""
 
 
 def log(msg):
@@ -306,8 +295,28 @@ def first_visible(page, selectors):
     return None
 
 
-def is_submit_ready(submit):
+def has_turnstile_token(page):
+    """检查页面隐藏的 cf-turnstile-response 是否已经生成非空 Token"""
     try:
+        inputs = page.locator(
+            'input[name="cf-turnstile-response"], '
+            'input[name="g-recaptcha-response"], '
+            '[name*="turnstile" i]'
+        )
+        for i in range(inputs.count()):
+            val = inputs.nth(i).input_value()
+            if val and len(val.strip()) > 20:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def is_submit_ready(page, submit):
+    try:
+        if has_turnstile_token(page) and not submit.is_disabled():
+            return True
+
         if not submit.is_visible():
             return False
 
@@ -322,6 +331,21 @@ def is_submit_ready(submit):
 
     except Exception:
         return False
+
+
+def human_mouse_click(page, x, y):
+    """模拟带有随机抖动与轨迹的人类鼠标点击"""
+    jitter_x = x + random.uniform(-3.0, 3.0)
+    jitter_y = y + random.uniform(-2.5, 2.5)
+    start_x = random.uniform(120, 480)
+    start_y = random.uniform(120, 380)
+    page.mouse.move(start_x, start_y, steps=random.randint(4, 8))
+    time.sleep(random.uniform(0.08, 0.18))
+    page.mouse.move(jitter_x, jitter_y, steps=random.randint(12, 22))
+    time.sleep(random.uniform(0.12, 0.25))
+    page.mouse.down()
+    time.sleep(random.uniform(0.06, 0.14))
+    page.mouse.up()
 
 
 def click_turnstile_box(page, password_locator=None, submit_locator=None):
@@ -344,9 +368,7 @@ def click_turnstile_box(page, password_locator=None, submit_locator=None):
                 if box and box["width"] >= 100 and box["height"] >= 35:
                     target_x = box["x"] + 28
                     target_y = box["y"] + box["height"] / 2
-                    page.mouse.move(target_x, target_y, steps=8)
-                    time.sleep(0.15)
-                    page.mouse.click(target_x, target_y)
+                    human_mouse_click(page, target_x, target_y)
                     log("🖱️ 已通过 iframe 坐标点击 Turnstile")
                     return True
             except Exception:
@@ -371,9 +393,7 @@ def click_turnstile_box(page, password_locator=None, submit_locator=None):
                 if box and box["width"] >= 150 and box["height"] >= 40:
                     target_x = box["x"] + 28
                     target_y = box["y"] + box["height"] / 2
-                    page.mouse.move(target_x, target_y, steps=8)
-                    time.sleep(0.15)
-                    page.mouse.click(target_x, target_y)
+                    human_mouse_click(page, target_x, target_y)
                     log(f"🖱️ 已通过容器 ({selector}) 坐标点击 Turnstile")
                     return True
         except Exception:
@@ -395,9 +415,7 @@ def click_turnstile_box(page, password_locator=None, submit_locator=None):
                 if div.locator("input, button").count() == 0:
                     target_x = box["x"] + 28
                     target_y = box["y"] + box["height"] / 2
-                    page.mouse.move(target_x, target_y, steps=8)
-                    time.sleep(0.15)
-                    page.mouse.click(target_x, target_y)
+                    human_mouse_click(page, target_x, target_y)
                     log("🖱️ 已通过尺寸匹配点击 Turnstile 区域")
                     return True
     except Exception:
@@ -413,9 +431,7 @@ def click_turnstile_box(page, password_locator=None, submit_locator=None):
                 if gap >= 50:
                     target_x = sub_box["x"] + 28
                     target_y = pw_bottom + (gap / 2)
-                    page.mouse.move(target_x, target_y, steps=8)
-                    time.sleep(0.15)
-                    page.mouse.click(target_x, target_y)
+                    human_mouse_click(page, target_x, target_y)
                     log("🖱️ 已通过密码框与提交按钮间距点击 Turnstile 区域")
                     return True
         except Exception:
@@ -428,20 +444,25 @@ def wait_and_solve_turnstile(
     page,
     submit,
     password_locator=None,
-    timeout_sec=35,
+    timeout_sec=50,
 ):
-    """等待安全验证完成，必要时主动点击 Turnstile"""
+    """等待安全验证完成，拉长点击冷却时间防止打断验证动画"""
     start_time = time.time()
+    last_click_time = 0.0
     click_attempts = 0
 
     while time.time() - start_time < timeout_sec:
-        if is_submit_ready(submit):
+        if is_submit_ready(page, submit):
             log("✅ 安全验证已通过，登录按钮已激活")
             return True
 
-        elapsed = time.time() - start_time
-        if elapsed >= 3.0 and int(elapsed) // 5 > click_attempts:
+        now = time.time()
+        elapsed = now - start_time
+
+        # 首次等待 4 秒让 Turnstile 先尝试自动静默通过；之后每 11 秒最多点击一次，避免打断正在转圈的验证
+        if elapsed >= 4.0 and (now - last_click_time) >= 11.0 and click_attempts < 4:
             click_attempts += 1
+            last_click_time = now
             log(f"⏳ 登录按钮仍禁用，尝试触发安全验证 (第 {click_attempts} 次)...")
             click_turnstile_box(
                 page,
@@ -451,7 +472,7 @@ def wait_and_solve_turnstile(
 
         page.wait_for_timeout(1000)
 
-    return is_submit_ready(submit)
+    return is_submit_ready(page, submit)
 
 
 def wait_for_server_panel_loaded(page, timeout_sec=15):
@@ -472,6 +493,17 @@ def wait_for_server_panel_loaded(page, timeout_sec=15):
     return False
 
 
+def human_type(locator, text):
+    """模拟人类逐字输入，增加页面行为可信度"""
+    locator.click()
+    time.sleep(random.uniform(0.15, 0.3))
+    try:
+        locator.fill("")
+        locator.press_sequentially(text, delay=random.randint(35, 75))
+    except Exception:
+        locator.fill(text)
+
+
 def login_if_needed(page):
     page.goto(
         SERVER_URL,
@@ -479,7 +511,7 @@ def login_if_needed(page):
         timeout=60000,
     )
 
-    page.wait_for_timeout(3000)
+    page.wait_for_timeout(3500)
 
     for _ in range(3):
         title_text = (page.title() or "").lower()
@@ -490,7 +522,7 @@ def login_if_needed(page):
         ):
             log("🛡️ 检测到 Cloudflare 全屏拦截页，尝试通过...")
             click_turnstile_box(page)
-            page.wait_for_timeout(4000)
+            page.wait_for_timeout(6000)
         else:
             break
 
@@ -543,15 +575,9 @@ def login_if_needed(page):
 
     log("🔐 正在填写登录信息...")
 
-    email.click()
-    page.wait_for_timeout(200)
-    email.fill(HOSTSHIP_LOGIN)
-
-    page.wait_for_timeout(300)
-
-    password.click()
-    page.wait_for_timeout(200)
-    password.fill(HOSTSHIP_PASSWORD)
+    human_type(email, HOSTSHIP_LOGIN)
+    page.wait_for_timeout(400)
+    human_type(password, HOSTSHIP_PASSWORD)
 
     submit = first_visible(
         page,
@@ -571,7 +597,7 @@ def login_if_needed(page):
         page,
         submit,
         password_locator=password,
-        timeout_sec=35,
+        timeout_sec=50,
     ):
         btn_label = ""
         try:
@@ -591,7 +617,7 @@ def login_if_needed(page):
         log("❌ 点击登录按钮超时")
         return False
 
-    for _ in range(10):
+    for _ in range(12):
         page.wait_for_timeout(1500)
         if "/auth/" not in page.url and "/login" not in page.url:
             break
@@ -692,7 +718,7 @@ def get_renewal_text(page):
 
 
 def inspect_renew_elements(page):
-    """打印页面上所有包含 Renew 字样的可见元素详情（标签、文本、坐标、属性），彻底告别盲猜"""
+    """打印页面上所有包含 Renew 字样的可见元素详情（标签、文本、坐标、属性）"""
     info_list = page.evaluate("""() => {
         const results = [];
         const all = document.querySelectorAll('button, a, [role="button"], div, span');
@@ -701,7 +727,6 @@ def inspect_renew_elements(page):
             if (!text || !/renew/i.test(text) || text.length > 60) continue;
             const rect = el.getBoundingClientRect();
             if (rect.width === 0 || rect.height === 0) continue;
-            // 只记录叶子节点或直接按钮，避免整页父容器刷屏
             if (el.tagName === 'DIV' && el.querySelectorAll('button, a').length > 0) continue;
             results.push({
                 tag: el.tagName.toLowerCase(),
@@ -744,7 +769,6 @@ def find_right_panel_renew_button(page):
         "never expire",
     ]
 
-    # 1. 优先寻找位于页面右侧（x > 500）且文字为 Renew 的按钮/可点击元素
     candidates = page.locator("button, a, [role='button'], div")
     best_match = None
 
@@ -764,7 +788,6 @@ def find_right_panel_renew_button(page):
             if any(w in lower_text for w in ignore_words):
                 continue
 
-            # 匹配 "Renew" 或 "Renew Now"
             if not re.match(r"^renew(?:\s+now)?$", lower_text, re.I):
                 continue
 
@@ -772,14 +795,12 @@ def find_right_panel_renew_button(page):
             if not box:
                 continue
 
-            # 右侧面板的卡片宽度通常在 200~500 之间，且 x 坐标在右侧（> 500）
             if box["x"] > 500 and 80 <= box["width"] <= 550 and 24 <= box["height"] <= 80:
                 tag_name = el.evaluate("el => el.tagName.toLowerCase()")
                 log(
                     f"🎯 锁定右侧 Renew 按钮: <{tag_name}> '{clean_text}' "
                     f"坐标=({int(box['x'])}, {int(box['y'])}, {int(box['width'])}x{int(box['height'])})"
                 )
-                # 如果它是 button 或 a，直接返回；如果是外层 div，继续看里面有没有子 button
                 if tag_name in ("button", "a"):
                     return el
                 best_match = el
@@ -789,7 +810,6 @@ def find_right_panel_renew_button(page):
     if best_match is not None:
         return best_match
 
-    # 2. 退一步：查找任意 x > 300 的含 Renew 的 button
     buttons = page.locator("button")
     try:
         for i in range(buttons.count()):
@@ -810,7 +830,7 @@ def find_right_panel_renew_button(page):
 
 
 def trigger_click_all_ways(page, locator, desc="按钮"):
-    """使用 Playwright click + 真实鼠标移动点击 + JS dispatchEvent 确保 React 100% 收到点击事件"""
+    """使用 Playwright click + 真实鼠标移动点击 确保 React 100% 收到点击事件"""
     try:
         locator.scroll_into_view_if_needed(timeout=5000)
         page.wait_for_timeout(300)
@@ -827,11 +847,7 @@ def trigger_click_all_ways(page, locator, desc="按钮"):
         cx = box["x"] + box["width"] / 2
         cy = box["y"] + box["height"] / 2
         log(f"🖱️ 移动鼠标并点击 {desc} 中心坐标: ({int(cx)}, {int(cy)})")
-        page.mouse.move(cx, cy, steps=8)
-        time.sleep(0.15)
-        page.mouse.down()
-        time.sleep(0.08)
-        page.mouse.up()
+        human_mouse_click(page, cx, cy)
         page.wait_for_timeout(500)
 
     try:
@@ -863,13 +879,7 @@ def dump_page_diff(before_lines, page):
 
 
 def handle_post_click_flow(page, before, right_renew_btn, api_tracker):
-    """
-    处理点击右侧 Renew 后的完整交互：
-    - 检测页面 URL 变化或新增弹窗文本
-    - 处理弹窗内可能存在的 Cloudflare Turnstile 验证码
-    - 点击弹窗内的确认按钮
-    - 如果右侧按钮毫无反应，尝试点击左侧导航栏的 'Renew server' 页面进行续期
-    """
+    """处理点击右侧 Renew 后的完整交互"""
     before_body = page.locator("body").inner_text()
     before_lines = set(
         line.strip() for line in before_body.splitlines() if line.strip()
@@ -880,7 +890,6 @@ def handle_post_click_flow(page, before, right_renew_btn, api_tracker):
 
     added_lines = dump_page_diff(before_lines, page)
 
-    # 如果第一次点完页面没有任何新增文本，也没触发任何 API，可能是点到了按钮里的图标或外层，尝试用 JS 直接点击该元素及其父/子元素
     if not added_lines and not api_tracker["called"]:
         log("🔄 第一次点击未触发弹窗或 API，尝试通过 JS 触发按钮及父级点击事件...")
         try:
@@ -895,22 +904,19 @@ def handle_post_click_flow(page, before, right_renew_btn, api_tracker):
         page.wait_for_timeout(2500)
         added_lines = dump_page_diff(before_lines, page)
 
-    # 检查是否已经直接续期成功或弹出提示（如冷却时间未到）
     body_now = page.locator("body").inner_text()
     after_now = get_renewal_text(page)
     if renewal_succeeded(before, after_now, body_now):
         log("✅ 点击后已直接完成续期")
         return True
 
-    # 检查页面上是否出现了 Turnstile 验证框（很多 Jexactyl 面板点击 Renew 后会在弹窗或按钮下方渲染 Turnstile）
-    for wait_round in range(6):
+    for wait_round in range(3):
         if click_turnstile_box(page):
             log(f"⏳ 已点击续期阶段的 Turnstile 验证框 (第 {wait_round + 1} 次)，等待验证通过...")
-            page.wait_for_timeout(3500)
+            page.wait_for_timeout(8000)
         else:
             break
 
-    # 扫描当前页面所有按钮，看看有没有新出现的弹窗确认按钮（Confirm / Renew now / Yes 等）
     inspect_renew_elements(page)
 
     modal_selectors = [
@@ -926,9 +932,9 @@ def handle_post_click_flow(page, before, right_renew_btn, api_tracker):
         'button[type="submit"]',
     ]
 
-    ignore_words = ["cancel", "close", "no", "upgrade", "premium", " dismissal"]
+    ignore_words = ["cancel", "close", "no", "upgrade", "premium", "dismissal"]
 
-    for attempt in range(4):
+    for _ in range(4):
         click_turnstile_box(page)
 
         for sel in modal_selectors:
@@ -944,7 +950,7 @@ def handle_post_click_flow(page, before, right_renew_btn, api_tracker):
                     if btn.is_disabled():
                         log(f"⏳ 发现弹窗按钮 [{txt}] 但处于禁用状态，尝试等待 Turnstile 解锁...")
                         click_turnstile_box(page)
-                        page.wait_for_timeout(3000)
+                        page.wait_for_timeout(6000)
                     if not btn.is_disabled():
                         log(f"✅ 点击弹窗确认按钮: [{txt}]")
                         trigger_click_all_ways(page, btn, f"弹窗确认按钮 ({txt})")
@@ -954,13 +960,11 @@ def handle_post_click_flow(page, before, right_renew_btn, api_tracker):
             except Exception:
                 pass
 
-        page.wait_for_timeout(1500)
+        page.wait_for_timeout(2000)
 
-    # 如果右侧的 Renew 按钮点击后完全是死按钮（前端 Bug），尝试点击左侧边栏的 "Renew server" 菜单项或者直接请求后端续期 API
     if not api_tracker["called"]:
         log("⚠️ 点击右侧 Renew 未触发任何后端请求，尝试查找左侧菜单 'Renew server' 或直接调用后端续期 API...")
 
-        # 尝试点击左侧导航栏中的 Renew server
         try:
             left_renew = page.locator("a, button, div, span").filter(
                 has_text=re.compile(r"^Renew\s+server$", re.I)
@@ -972,10 +976,9 @@ def handle_post_click_flow(page, before, right_renew_btn, api_tracker):
                 dump_page_diff(before_lines, page)
                 inspect_renew_elements(page)
 
-                # 如果进入了专门的续期子页面或弹出了新界面，处理里面的 Turnstile 和按钮
-                for _ in range(3):
-                    click_turnstile_box(page)
-                    page.wait_for_timeout(2000)
+                for _ in range(2):
+                    if click_turnstile_box(page):
+                        page.wait_for_timeout(7000)
 
                 sub_btns = page.locator("button")
                 for i in range(sub_btns.count()):
@@ -993,7 +996,6 @@ def handle_post_click_flow(page, before, right_renew_btn, api_tracker):
         except Exception as exc:
             log(f"⚠️ 尝试左侧菜单异常: {exc}")
 
-    # 终极保底：如果还是没有触发任何 renew API，在浏览器上下文内直接用 fetch 探测常见的 Jexactyl/Pterodactyl 续期 API 端点
     if not api_tracker["called"]:
         srv_id = server_id()
         log(f"📡 尝试通过浏览器会话直接调用后端续期接口 (Server ID: {srv_id})...")
@@ -1142,8 +1144,9 @@ def main():
     )
 
     use_headless = resolve_headless()
+    engine_name = "Patchright" if USING_PATCHRIGHT else "Playwright"
     log(
-        f"🖥️ 浏览器模式：{'Headless' if use_headless else 'Headed (XVFB/GUI)'}"
+        f"🖥️ 浏览器模式：{'Headless' if use_headless else 'Headed (XVFB/GUI)'} ({engine_name})"
     )
 
     with sync_playwright() as p:
@@ -1152,38 +1155,32 @@ def main():
             "--disable-setuid-sandbox",
             "--disable-dev-shm-usage",
             "--disable-blink-features=AutomationControlled",
-            "--disable-infobars",
             "--window-size=1440,1000",
         ]
 
-        browser = p.chromium.launch(
-            headless=use_headless,
-            proxy={
-                "server": PROXY_SERVER
-            }
-            if IS_PROXY
-            else None,
-            args=launch_args,
-        )
+        launch_kwargs = {
+            "headless": use_headless,
+            "proxy": {"server": PROXY_SERVER} if IS_PROXY else None,
+            "args": launch_args,
+        }
 
-        temp_page = browser.new_page()
-        native_ua = temp_page.evaluate("() => navigator.userAgent")
-        temp_page.close()
-        clean_ua = native_ua.replace("HeadlessChrome/", "Chrome/")
+        # 优先使用真实 Chrome 通道以获得完整的 TLS/客户端指纹
+        try:
+            browser = p.chromium.launch(channel="chrome", **launch_kwargs)
+        except Exception:
+            browser = p.chromium.launch(**launch_kwargs)
 
+        # 不手动覆写 user_agent，避免主线程与 Web Worker 内的 Client Hints 指纹不一致
         context = browser.new_context(
             viewport={
                 "width": 1440,
                 "height": 1000,
             },
-            user_agent=clean_ua,
             locale="en-US",
         )
-        context.add_init_script(STEALTH_INIT_SCRIPT)
 
         page = context.new_page()
 
-        # 监听所有非静态资源的 POST/PUT/PATCH/DELETE 请求以及含 renew 的请求
         api_tracker = {"called": False, "ok": False, "status": None, "body": ""}
 
         def on_response(response):
@@ -1326,7 +1323,6 @@ def main():
 
                 return 0
 
-            # 如果后端明确返回了冷却限制提示（例如 400/429 Too Many Requests 或未到时间）
             api_body_lower = (api_tracker.get("body") or "").lower()
             if any(
                 kw in api_body_lower

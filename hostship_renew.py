@@ -56,6 +56,18 @@ def log(msg):
     )
 
 
+def save_debug_screenshot(page, prefix="hostship_error"):
+    """保存调试截图，供 GitHub Actions 上传 Artifact 排查"""
+    if not page:
+        return
+    try:
+        filename = f"{prefix}_{int(time.time())}.png"
+        page.screenshot(path=filename, full_page=True)
+        log(f"📸 已保存调试截图: {filename}")
+    except Exception as exc:
+        log(f"⚠️ 保存截图失败: {exc}")
+
+
 def server_id():
     if not SERVER_URL:
         return "未知"
@@ -261,11 +273,12 @@ def first_visible(page, selectors):
 
 
 LOGIN_SUBMIT_SELECTORS = [
+    'button[type="submit"]',
     'button:has-text("Sign In")',
     'button:has-text("Sign in")',
     'button:has-text("Login")',
     'button:has-text("Log in")',
-    'button:has-text("Continue")',
+    'button:has-text("Continue"):not(:has-text("Discord"))',
     'button:has-text("Complete the security check")',
 ]
 
@@ -274,10 +287,6 @@ def find_login_submit_button(page):
     """仅在登录页查找登录按钮，严格排除 Logout 和 Discord 按钮"""
     if "/auth/login" not in page.url:
         return None
-
-    btn = first_visible(page, LOGIN_SUBMIT_SELECTORS)
-    if btn:
-        return btn
 
     try:
         buttons = page.locator("button")
@@ -290,7 +299,8 @@ def find_login_submit_button(page):
                     return item
     except Exception:
         pass
-    return None
+
+    return first_visible(page, LOGIN_SUBMIT_SELECTORS)
 
 
 def has_turnstile_token(page):
@@ -312,6 +322,9 @@ def has_turnstile_token(page):
 def is_submit_ready(page, fallback_submit=None):
     """动态检查当前提交按钮是否已解除禁用且不再显示 security check"""
     try:
+        if has_turnstile_token(page):
+            return True
+
         submit = find_login_submit_button(page) if "/auth/login" in page.url else fallback_submit
         if not submit or not submit.is_visible():
             return False
@@ -320,7 +333,7 @@ def is_submit_ready(page, fallback_submit=None):
             return False
 
         btn_text = (submit.inner_text(timeout=1000) or "").strip().lower()
-        if "security check" in btn_text or "logout" in btn_text:
+        if "security check" in btn_text or "logout" in btn_text or "discord" in btn_text:
             return False
 
         return True
@@ -365,10 +378,91 @@ def human_mouse_click(page, x, y, start_x=None, start_y=None):
     page.mouse.up()
 
 
+def set_react_input_value(locator, text):
+    """通过原生 HTMLInputElement value setter 强制写入并派发 React input/change 事件"""
+    try:
+        locator.evaluate(
+            """(el, val) => {
+                el.focus();
+                const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype,
+                    'value'
+                ).set;
+                nativeInputValueSetter.call(el, val);
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+            }""",
+            text,
+        )
+    except Exception:
+        pass
+
+
+def human_type(page, locator, text):
+    """
+    安全且兼容 React 受控组件的真人输入：
+    1. 鼠标移动到输入框并点击聚焦
+    2. 清空原有内容并使用 press_sequentially 模拟逐字输入
+    3. 严格校验 input_value()，若不一致则使用 React 原生 setter 修正，防止漏输或多出空格
+    """
+    try:
+        box = locator.bounding_box(timeout=3000)
+        if box:
+            cx = box["x"] + box["width"] * random.uniform(0.3, 0.7)
+            cy = box["y"] + box["height"] * random.uniform(0.35, 0.65)
+            page.mouse.move(cx, cy, steps=random.randint(6, 12))
+            time.sleep(random.uniform(0.08, 0.15))
+            page.mouse.click(cx, cy)
+        else:
+            locator.click(timeout=3000)
+    except Exception:
+        try:
+            locator.click(timeout=3000)
+        except Exception:
+            pass
+
+    time.sleep(random.uniform(0.1, 0.2))
+
+    try:
+        locator.fill("")
+    except Exception:
+        pass
+
+    try:
+        locator.press_sequentially(text, delay=random.randint(35, 85))
+    except Exception:
+        for ch in text:
+            page.keyboard.type(ch, delay=random.randint(35, 85))
+
+    time.sleep(random.uniform(0.15, 0.25))
+
+    # 校验实际输入框的值是否与预期完全一致（防止残留字符或意外空格）
+    try:
+        actual_val = locator.input_value(timeout=1500)
+        if actual_val != text:
+            set_react_input_value(locator, text)
+            time.sleep(0.15)
+    except Exception:
+        set_react_input_value(locator, text)
+
+
+def ensure_credentials_intact(user_input, pass_input):
+    """在点击登录前再次确认账号密码没有因为 Tab/Space 操作被篡改或追加空格"""
+    try:
+        if user_input and user_input.input_value(timeout=1000) != HOSTSHIP_LOGIN:
+            log("🔧 检测到用户名输入值异常，正在自动修正...")
+            set_react_input_value(user_input, HOSTSHIP_LOGIN)
+        if pass_input and pass_input.input_value(timeout=1000) != HOSTSHIP_PASSWORD:
+            log("🔧 检测到密码框输入值被改动（如末尾多出空格），正在自动修正...")
+            set_react_input_value(pass_input, HOSTSHIP_PASSWORD)
+    except Exception:
+        pass
+
+
 def click_turnstile_box(page, password_locator=None, submit_locator=None, attempt=1):
     """
     【核心原则】绝不查询或定位 iframe[src*="challenges.cloudflare.com"]！
-    第 1 优先级：使用实测 2 秒秒过的【密码框原生 Tab 焦点切换（自动跳过 Forgot password?）+ Space】。
+    第 1 优先级：密码框原生 Tab 焦点切换（自动跳过 Forgot password? 并确保焦点已离开 INPUT）+ Space。
     第 2 优先级：使用提交按钮正上方 48px 处的物理坐标点击。
     """
     start_x, start_y = None, None
@@ -387,18 +481,25 @@ def click_turnstile_box(page, password_locator=None, submit_locator=None, attemp
     if password_locator and attempt in (1, 3):
         try:
             log("⌨️ 尝试通过密码框原生焦点切换 (Tab + Space) 触发 Turnstile...")
-            password_locator.click(timeout=2000)
-            time.sleep(random.uniform(0.2, 0.35))
-            page.keyboard.press("Tab")
-            time.sleep(random.uniform(0.25, 0.4))
-            is_link = page.evaluate(
-                "() => document.activeElement && document.activeElement.tagName === 'A'"
-            )
-            if is_link:
+            password_locator.focus(timeout=2000)
+            time.sleep(random.uniform(0.15, 0.3))
+
+            # 最多按 3 次 Tab，直到焦点既不在 INPUT 也不在 A (Forgot password?) 上
+            for _ in range(3):
                 page.keyboard.press("Tab")
-                time.sleep(random.uniform(0.3, 0.5))
-            page.keyboard.press("Space")
-            return True
+                time.sleep(random.uniform(0.25, 0.4))
+                active_tag = page.evaluate(
+                    "() => (document.activeElement && document.activeElement.tagName) || ''"
+                )
+                if active_tag not in ("INPUT", "A"):
+                    break
+
+            active_tag = page.evaluate(
+                "() => (document.activeElement && document.activeElement.tagName) || ''"
+            )
+            if active_tag not in ("INPUT", "A"):
+                page.keyboard.press("Space")
+                return True
         except Exception:
             pass
 
@@ -544,40 +645,46 @@ def navigate_to_server_panel(page, timeout_sec=35):
     return is_on_server_detail_page(page)
 
 
-def human_type(page, locator, text):
-    """使用带鼠标移动的真实点击聚焦，并以随机按键间隔输入文本"""
+def get_login_error_banner(page):
+    """提取登录页可能出现的错误提示（如密码错误、验证码过期等）"""
     try:
-        box = locator.bounding_box(timeout=3000)
-        if box:
-            cx = box["x"] + box["width"] * random.uniform(0.3, 0.7)
-            cy = box["y"] + box["height"] * random.uniform(0.35, 0.65)
-            page.mouse.move(cx, cy, steps=random.randint(8, 15))
-            time.sleep(random.uniform(0.08, 0.18))
-            page.mouse.click(cx, cy)
-        else:
-            locator.click(timeout=3000)
+        err = page.evaluate("""() => {
+            const selectors = [
+                '[role="alert"]',
+                '.toast',
+                '.error',
+                '[class*="error" i]',
+                '[class*="alert" i]',
+                '[class*="danger" i]',
+                'form p'
+            ];
+            for (const sel of selectors) {
+                const els = document.querySelectorAll(sel);
+                for (const el of els) {
+                    const txt = (el.innerText || '').trim();
+                    if (txt && txt.length > 3 && txt.length < 150 && !/welcome|sign in to continue/i.test(txt)) {
+                        return txt;
+                    }
+                }
+            }
+            return '';
+        }""")
+        return (err or "").strip()
     except Exception:
-        locator.click(timeout=3000)
-
-    time.sleep(random.uniform(0.15, 0.3))
-    page.keyboard.press("Control+A")
-    time.sleep(random.uniform(0.05, 0.12))
-    page.keyboard.press("Backspace")
-    time.sleep(random.uniform(0.1, 0.2))
-
-    for ch in text:
-        page.keyboard.type(ch, delay=random.randint(45, 115))
-    time.sleep(random.uniform(0.2, 0.4))
+        return ""
 
 
-def submit_login_form(page):
+def submit_login_form(page, user_input=None, pass_input=None):
     """
     验证通过后提交登录表单：
-    仅点击一次 Sign In 按钮并等待页面自然跳转离开 /auth/login，绝不触发二次盲点（防止误点 Dashboard 的 Logout 按钮）。
+    1. 确保账号密码未被篡改（例如 Tab+Space 误输入空格）
+    2. 优先使用 Playwright 原生 click 触发按钮点击，若未跳转则辅以 Enter / requestSubmit 重试
+    3. 严控仅在 `/auth/login` 页面内操作，一旦离开立即停止，绝不误触 Dashboard 的 Logout
     """
     time.sleep(0.5)
-    active_btn = find_login_submit_button(page)
+    ensure_credentials_intact(user_input, pass_input)
 
+    active_btn = find_login_submit_button(page)
     if active_btn:
         try:
             btn_label = (active_btn.inner_text(timeout=1500) or "").strip()
@@ -585,27 +692,65 @@ def submit_login_form(page):
         except Exception:
             log("🚀 正在提交登录...")
 
+        # 第 1 次点击：优先使用 Playwright 原生 click（自动等待可点击并触发完整 pointer/mouse 事件链）
         try:
-            box = active_btn.bounding_box(timeout=2000)
-            if box:
-                human_mouse_click(
-                    page,
-                    box["x"] + box["width"] / 2,
-                    box["y"] + box["height"] / 2,
-                )
-            else:
-                active_btn.click(timeout=2500)
+            active_btn.click(timeout=3000)
         except Exception:
             try:
-                active_btn.click(timeout=2500)
+                box = active_btn.bounding_box(timeout=2000)
+                if box:
+                    human_mouse_click(
+                        page,
+                        box["x"] + box["width"] / 2,
+                        box["y"] + box["height"] / 2,
+                    )
             except Exception:
                 pass
 
     leave_start = time.time()
-    while time.time() - leave_start < 15:
+    retried_submit = False
+
+    while time.time() - leave_start < 18:
         if "/auth/login" not in page.url:
             return True
+
+        # 如果 4 秒后仍在 /auth/login，检查是否有报错提示或需要补充触发 Enter / requestSubmit
+        if not retried_submit and (time.time() - leave_start) >= 4.0:
+            retried_submit = True
+            err_txt = get_login_error_banner(page)
+            if err_txt:
+                log(f"⚠️ 登录页提示信息: {err_txt}")
+
+            if "/auth/login" in page.url:
+                ensure_credentials_intact(user_input, pass_input)
+                btn_now = find_login_submit_button(page)
+                if btn_now and not btn_now.is_disabled(timeout=1000):
+                    log("🔄 页面仍停留在登录页，正在尝试回车与表单提交...")
+                    try:
+                        if pass_input:
+                            pass_input.press("Enter", timeout=2000)
+                        else:
+                            btn_now.click(timeout=2000)
+                    except Exception:
+                        pass
+
+                    time.sleep(1.0)
+                    if "/auth/login" in page.url:
+                        try:
+                            page.evaluate("""() => {
+                                const form = document.querySelector('form');
+                                if (form && typeof form.requestSubmit === 'function') {
+                                    form.requestSubmit();
+                                }
+                            }""")
+                        except Exception:
+                            pass
+
         time.sleep(0.5)
+
+    err_txt = get_login_error_banner(page)
+    if err_txt:
+        log(f"❌ 登录失败页面提示: {err_txt}")
 
     return "/auth/login" not in page.url
 
@@ -646,7 +791,7 @@ def login_if_needed(page):
 
         log("🔐 正在填写登录信息...")
         human_type(page, user_input, HOSTSHIP_LOGIN)
-        time.sleep(random.uniform(0.3, 0.6))
+        time.sleep(random.uniform(0.25, 0.5))
         human_type(page, pass_input, HOSTSHIP_PASSWORD)
 
         submit_btn = find_login_submit_button(page)
@@ -659,14 +804,18 @@ def login_if_needed(page):
             password_locator=pass_input,
             timeout_sec=50,
         ):
+            save_debug_screenshot(page, "hostship_turnstile_timeout")
             raise RuntimeError(
                 "登录按钮始终处于禁用状态 (Complete the security check)，未能通过 Cloudflare 安全验证"
             )
 
-        submit_login_form(page)
+        submit_login_form(page, user_input=user_input, pass_input=pass_input)
 
     if not navigate_to_server_panel(page, timeout_sec=35):
-        raise RuntimeError(f"登录后未能进入服务器控制面板页面 (当前 URL: {page.url})")
+        save_debug_screenshot(page, "hostship_login_stuck")
+        err_hint = get_login_error_banner(page)
+        suffix = f"，页面提示: {err_hint}" if err_hint else ""
+        raise RuntimeError(f"登录后未能进入服务器控制面板页面 (当前 URL: {page.url}{suffix})")
 
     log("✅ 登录成功，已进入服务器面板")
     return True
@@ -694,8 +843,8 @@ def get_renewal_text(page):
     精准提取截图 3 右下角到期卡片信息：
     支持：
       EXPIRES 18 NOV
-      6 Days
-    并统一格式化为：'6 Days (EXPIRES 18 NOV)'
+      5 Days
+    并统一格式化为：'5 Days (EXPIRES 18 NOV)'
     """
     try:
         body_text = page.locator("body").inner_text(timeout=5000)
@@ -789,6 +938,12 @@ def trigger_click_all_ways(page, btn):
         pass
 
     try:
+        btn.click(timeout=3000)
+        return True
+    except Exception:
+        pass
+
+    try:
         box = btn.bounding_box(timeout=2000)
         if box:
             human_mouse_click(
@@ -797,12 +952,6 @@ def trigger_click_all_ways(page, btn):
                 box["y"] + box["height"] / 2,
             )
             return True
-    except Exception:
-        pass
-
-    try:
-        btn.click(timeout=3000)
-        return True
     except Exception:
         pass
 
@@ -901,6 +1050,7 @@ def run_attempt(use_proxy):
     log(f"🖥️ 浏览器模式：{mode_str} ({engine_str})")
 
     user_data_dir = tempfile.mkdtemp(prefix="hostship_profile_")
+    page = None
 
     try:
         with sync_playwright() as p:
@@ -971,6 +1121,7 @@ def run_attempt(use_proxy):
                     tg(msg)
                     context.close()
                     return True, None
+                save_debug_screenshot(page, "hostship_no_renew_btn")
                 raise RuntimeError("未能在面板中找到续期 (Renew) 按钮")
 
             if renew_btn.is_disabled(timeout=2000):
@@ -1004,6 +1155,7 @@ def run_attempt(use_proxy):
                 context.close()
                 return True, None
 
+            save_debug_screenshot(page, "hostship_renew_unchanged")
             context.close()
             raise RuntimeError(f"点击续期后状态未发生变化（当前状态：{after_status}）")
 

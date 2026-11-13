@@ -189,7 +189,7 @@ def current_ip(use_proxy=None):
         return "获取失败"
 
 
-def build_check_message(status, ip, use_proxy, reason="未到续期时间（需低于 14 天）"):
+def build_check_message(status, ip, use_proxy, reason="未到续期时间"):
     days = get_days(status)
     renew_date = estimate_renew_date(status)
     now = beijing_now()
@@ -399,12 +399,7 @@ def set_react_input_value(locator, text):
 
 
 def human_type(page, locator, text):
-    """
-    安全且兼容 React 受控组件的真人输入：
-    1. 鼠标移动到输入框并点击聚焦
-    2. 清空原有内容并使用 press_sequentially 模拟逐字输入
-    3. 严格校验 input_value()，若不一致则使用 React 原生 setter 修正，防止漏输或多出空格
-    """
+    """安全且兼容 React 受控组件的真人输入"""
     try:
         box = locator.bounding_box(timeout=3000)
         if box:
@@ -436,7 +431,6 @@ def human_type(page, locator, text):
 
     time.sleep(random.uniform(0.15, 0.25))
 
-    # 校验实际输入框的值是否与预期完全一致（防止残留字符或意外空格）
     try:
         actual_val = locator.input_value(timeout=1500)
         if actual_val != text:
@@ -464,6 +458,7 @@ def click_turnstile_box(page, password_locator=None, submit_locator=None, attemp
     【核心原则】绝不查询或定位 iframe[src*="challenges.cloudflare.com"]！
     第 1 优先级：密码框原生 Tab 焦点切换（自动跳过 Forgot password? 并确保焦点已离开 INPUT）+ Space。
     第 2 优先级：使用提交按钮正上方 48px 处的物理坐标点击。
+    第 3 优先级：匹配外层宿主容器物理坐标点击。
     """
     start_x, start_y = None, None
     pw_bottom = 0
@@ -477,14 +472,12 @@ def click_turnstile_box(page, password_locator=None, submit_locator=None, attemp
         except Exception:
             pass
 
-    # 策略 1（首选）：通过密码框原生焦点切换 (Tab 跳过 Forgot password? -> Space)
     if password_locator and attempt in (1, 3):
         try:
             log("⌨️ 尝试通过密码框原生焦点切换 (Tab + Space) 触发 Turnstile...")
             password_locator.focus(timeout=2000)
             time.sleep(random.uniform(0.15, 0.3))
 
-            # 最多按 3 次 Tab，直到焦点既不在 INPUT 也不在 A (Forgot password?) 上
             for _ in range(3):
                 page.keyboard.press("Tab")
                 time.sleep(random.uniform(0.25, 0.4))
@@ -503,7 +496,6 @@ def click_turnstile_box(page, password_locator=None, submit_locator=None, attemp
         except Exception:
             pass
 
-    # 策略 2：通过提交按钮正上方偏移计算坐标（Turnstile 紧贴在提交按钮上方约 48px 处）
     cur_submit = find_login_submit_button(page) or submit_locator
     if cur_submit:
         try:
@@ -512,18 +504,17 @@ def click_turnstile_box(page, password_locator=None, submit_locator=None, attemp
                 target_x = sub_box["x"] + 30
                 target_y = sub_box["y"] - 48
                 human_mouse_click(page, target_x, target_y, start_x, start_y)
-                log(f"🖱️ 已通过提交按钮上方偏移物理坐标点击 Turnstile: ({int(target_x)}, {int(target_y)})")
+                log(f"🖱️ 已通过按钮上方偏移物理坐标点击 Turnstile: ({int(target_x)}, {int(target_y)})")
                 return True
         except Exception:
             pass
 
-    # 策略 3：仅匹配位于密码框下方 (rect.y > pw_bottom) 的外层宿主容器
     try:
         box = page.evaluate("""(minY) => {
-            const els = document.querySelectorAll('.cf-turnstile, [data-sitekey], form div, [role="dialog"] div');
+            const els = document.querySelectorAll('.cf-turnstile, [data-sitekey], form div, [role="dialog"] div, div');
             for (const el of els) {
                 const rect = el.getBoundingClientRect();
-                if (rect.y >= minY && rect.width >= 250 && rect.width <= 420 && rect.height >= 55 && rect.height <= 80) {
+                if (rect.y >= minY && rect.width >= 240 && rect.width <= 420 && rect.height >= 55 && rect.height <= 80) {
                     if (el.querySelectorAll('input:not([type="hidden"]), button, a').length === 0) {
                         return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
                     }
@@ -556,7 +547,7 @@ def wait_and_solve_turnstile(
 
     while time.time() - start_time < timeout_sec:
         if is_submit_ready(page, submit):
-            log("✅ 安全验证已通过，登录按钮已激活")
+            log("✅ 安全验证已通过，按钮已激活")
             return True
 
         now = time.time()
@@ -565,7 +556,7 @@ def wait_and_solve_turnstile(
         if elapsed >= 5.0 and (now - last_click_time) >= 11.0 and click_attempts < 3:
             click_attempts += 1
             last_click_time = now
-            log(f"⏳ 登录按钮仍禁用，尝试触发安全验证 (第 {click_attempts} 次)...")
+            log(f"⏳ 按钮仍禁用，尝试触发安全验证 (第 {click_attempts} 次)...")
             click_turnstile_box(
                 page,
                 password_locator=password_locator,
@@ -594,9 +585,7 @@ def is_on_server_detail_page(page):
 
 
 def navigate_to_server_panel(page, timeout_sec=35):
-    """
-    如果登录后停留在 Dashboard 主页（截图 2），自动点击 MANAGE SERVER 或跳转到 SERVER_URL 进入服务器详情页（截图 3）
-    """
+    """如果登录后停留在 Dashboard 主页（截图 2），自动点击 MANAGE SERVER 或跳转到 SERVER_URL 进入服务器详情页（截图 3）"""
     start = time.time()
     sid = server_id()
 
@@ -646,12 +635,17 @@ def navigate_to_server_panel(page, timeout_sec=35):
 
 
 def get_login_error_banner(page):
-    """提取登录页可能出现的错误提示（如密码错误、验证码过期等）"""
+    """提取页面可能出现的错误或提示横幅（Toast / Alert）"""
     try:
         err = page.evaluate("""() => {
             const selectors = [
                 '[role="alert"]',
+                '[role="status"]',
                 '.toast',
+                '.Toastify__toast',
+                '[class*="toast" i]',
+                '[class*="notification" i]',
+                '[class*="snackbar" i]',
                 '.error',
                 '[class*="error" i]',
                 '[class*="alert" i]',
@@ -661,8 +655,8 @@ def get_login_error_banner(page):
             for (const sel of selectors) {
                 const els = document.querySelectorAll(sel);
                 for (const el of els) {
-                    const txt = (el.innerText || '').trim();
-                    if (txt && txt.length > 3 && txt.length < 150 && !/welcome|sign in to continue/i.test(txt)) {
+                    const txt = (el.innerText || '').trim().replace(/\\s+/g, ' ');
+                    if (txt && txt.length > 3 && txt.length < 200 && !/welcome|sign in to continue|buy one server/i.test(txt)) {
                         return txt;
                     }
                 }
@@ -675,12 +669,7 @@ def get_login_error_banner(page):
 
 
 def submit_login_form(page, user_input=None, pass_input=None):
-    """
-    验证通过后提交登录表单：
-    1. 确保账号密码未被篡改（例如 Tab+Space 误输入空格）
-    2. 优先使用 Playwright 原生 click 触发按钮点击，若未跳转则辅以 Enter / requestSubmit 重试
-    3. 严控仅在 `/auth/login` 页面内操作，一旦离开立即停止，绝不误触 Dashboard 的 Logout
-    """
+    """验证通过后提交登录表单"""
     time.sleep(0.5)
     ensure_credentials_intact(user_input, pass_input)
 
@@ -692,7 +681,6 @@ def submit_login_form(page, user_input=None, pass_input=None):
         except Exception:
             log("🚀 正在提交登录...")
 
-        # 第 1 次点击：优先使用 Playwright 原生 click（自动等待可点击并触发完整 pointer/mouse 事件链）
         try:
             active_btn.click(timeout=3000)
         except Exception:
@@ -714,7 +702,6 @@ def submit_login_form(page, user_input=None, pass_input=None):
         if "/auth/login" not in page.url:
             return True
 
-        # 如果 4 秒后仍在 /auth/login，检查是否有报错提示或需要补充触发 Enter / requestSubmit
         if not retried_submit and (time.time() - leave_start) >= 4.0:
             retried_submit = True
             err_txt = get_login_error_banner(page)
@@ -822,15 +809,26 @@ def login_if_needed(page):
 
 
 def is_renew_limit_reached(text):
+    """判断页面或 API 返回文本是否提示尚未达到可续期时间"""
     if not text:
         return False
     patterns = [
         r"already\s+renewed",
         r"cannot\s+renew\s+yet",
+        r"can\s*not\s+renew",
+        r"unable\s+to\s+renew",
         r"only\s+renew\s+when",
-        r"less\s+than\s+14\s+days",
+        r"only\s+be\s+renewed",
+        r"less\s+than\s+\d+\s*(days?|hours?)",
         r"wait\s+until",
+        r"wait\s+\d+",
         r"not\s+eligible\s+for\s+renewal",
+        r"too\s+early\s+to\s+renew",
+        r"renew\s+cooldown",
+        r"cooldown",
+        r"try\s+again\s+later",
+        r"before\s+expiration",
+        r"before\s+it\s+expires",
     ]
     for p in patterns:
         if re.search(p, text, re.I):
@@ -842,9 +840,9 @@ def get_renewal_text(page):
     """
     精准提取截图 3 右下角到期卡片信息：
     支持：
-      EXPIRES 18 NOV
+      EXPIRES 17 NOV
       5 Days
-    并统一格式化为：'5 Days (EXPIRES 18 NOV)'
+    并统一格式化为：'5 Days (EXPIRES 17 NOV)'
     """
     try:
         body_text = page.locator("body").inner_text(timeout=5000)
@@ -884,6 +882,7 @@ def get_renewal_text(page):
 
 
 def inspect_renew_elements(page):
+    """诊断并打印页面上所有与续期相关的元素详情（包含 class、disabled、坐标、父容器状态）"""
     try:
         info = page.evaluate("""() => {
             const results = [];
@@ -891,11 +890,17 @@ def inspect_renew_elements(page):
             for (const el of els) {
                 const txt = (el.innerText || el.textContent || '').trim().replace(/\\s+/g, ' ');
                 const rect = el.getBoundingClientRect();
-                if (rect.width > 0 && rect.height > 0 && /renew|extend|free/i.test(txt)) {
+                if (rect.width > 0 && rect.height > 0 && /renew|extend|confirm|security|continue/i.test(txt)) {
+                    const style = window.getComputedStyle(el);
                     results.push({
                         tag: el.tagName,
                         text: txt.slice(0, 60),
                         disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true',
+                        cls: (el.className || '').toString().slice(0, 80),
+                        cursor: style.cursor,
+                        opacity: style.opacity,
+                        pointerEvents: style.pointerEvents,
+                        href: el.getAttribute('href') || '',
                         x: Math.round(rect.x),
                         y: Math.round(rect.y),
                         w: Math.round(rect.width),
@@ -905,12 +910,36 @@ def inspect_renew_elements(page):
             }
             return results;
         }""")
+        if info:
+            log(f"🔍 页面相关按钮诊断: {info}")
         return info or []
     except Exception:
         return []
 
 
+def is_element_pseudo_disabled(btn):
+    """检查按钮是否处于原生 disabled 或 CSS 伪禁用状态（如 cursor-not-allowed / opacity-50）"""
+    try:
+        if btn.is_disabled(timeout=1000):
+            return True
+        return btn.evaluate("""(el) => {
+            if (el.disabled || el.getAttribute('aria-disabled') === 'true') return true;
+            const cls = (el.className || '').toString().toLowerCase();
+            if (cls.includes('disabled') || cls.includes('cursor-not-allowed') || cls.includes('pointer-events-none')) {
+                return true;
+            }
+            const style = window.getComputedStyle(el);
+            if (style.pointerEvents === 'none' || style.cursor === 'not-allowed') {
+                return true;
+            }
+            return false;
+        }""")
+    except Exception:
+        return False
+
+
 def find_right_panel_renew_button(page):
+    """查找右侧面板底部的 Renew 按钮"""
     selectors = [
         'button:has-text("Renew")',
         'button:has-text("RENEW")',
@@ -932,33 +961,56 @@ def find_right_panel_renew_button(page):
 
 
 def trigger_click_all_ways(page, btn):
+    """
+    全方位确保按钮被真实滚动到视口中央并触发点击：
+    1. 使用 JS scrollIntoView({block: 'center'}) 解决内层滚动容器遮挡问题
+    2. 依次使用 Playwright click -> 物理鼠标轨迹点击 -> 原生 JS click() 派发
+    """
     try:
-        btn.scroll_into_view_if_needed(timeout=2000)
+        btn.evaluate("el => el.scrollIntoView({ behavior: 'instant', block: 'center', inline: 'center' })")
+        time.sleep(0.4)
     except Exception:
-        pass
+        try:
+            btn.scroll_into_view_if_needed(timeout=2000)
+            time.sleep(0.3)
+        except Exception:
+            pass
 
+    clicked = False
+
+    # 方式 1：Playwright 原生 click
     try:
         btn.click(timeout=3000)
-        return True
+        clicked = True
     except Exception:
         pass
 
-    try:
-        box = btn.bounding_box(timeout=2000)
-        if box:
-            human_mouse_click(
-                page,
-                box["x"] + box["width"] / 2,
-                box["y"] + box["height"] / 2,
-            )
-            return True
-    except Exception:
-        pass
+    # 方式 2：如果未成功或为了保险，结合 bounding_box 物理点击
+    if not clicked:
+        try:
+            box = btn.bounding_box(timeout=2000)
+            if box:
+                human_mouse_click(
+                    page,
+                    box["x"] + box["width"] / 2,
+                    box["y"] + box["height"] / 2,
+                )
+                clicked = True
+        except Exception:
+            pass
 
-    return False
+    # 方式 3：兜底使用 JS 原生 click()
+    if not clicked:
+        try:
+            btn.evaluate("el => el.click()")
+            clicked = True
+        except Exception:
+            pass
+
+    return clicked
 
 
-def renewal_succeeded(before, after, page_text=""):
+def renewal_succeeded(before, after, page_text="", api_messages=None):
     before_days = get_days(before)
     after_days = get_days(after)
 
@@ -970,9 +1022,10 @@ def renewal_succeeded(before, after, page_text=""):
     if before_exp and after_exp and before_exp != after_exp:
         return True
 
+    combined_text = (page_text or "") + "\n" + "\n".join(api_messages or [])
     if re.search(
         r"successfully\s+renewed|renewal\s+successful|server\s+has\s+been\s+renewed|renewed\s+successfully",
-        page_text,
+        combined_text,
         re.I,
     ):
         return True
@@ -980,36 +1033,12 @@ def renewal_succeeded(before, after, page_text=""):
     return False
 
 
-def wait_for_renewal_result(page, before_status, timeout_sec=35):
-    start = time.time()
-    while time.time() - start < timeout_sec:
-        after_status = get_renewal_text(page)
-        try:
-            body_text = page.locator("body").inner_text(timeout=2000)
-        except Exception:
-            body_text = ""
-
-        if renewal_succeeded(before_status, after_status, body_text):
-            return True, after_status
-
-        time.sleep(1.5)
-
-    return False, get_renewal_text(page)
-
-
-def handle_post_click_flow(page, before_status):
-    """处理点击续期按钮后可能弹出的确认弹窗、二次 Turnstile 验证或直接刷新结果"""
-    time.sleep(2.5)
-
-    after_now = get_renewal_text(page)
-    try:
-        body_now = page.locator("body").inner_text(timeout=2000)
-    except Exception:
-        body_now = ""
-    if renewal_succeeded(before_status, after_now, body_now):
-        return True, after_now
-
-    modal_confirm_selectors = [
+def find_secondary_confirm_button(page, initial_renew_box=None):
+    """
+    查找点击 Renew 之后页面上新出现的确认按钮（不局限在 [role="dialog"] 中）：
+    排除原本右侧面板底部的那个 Renew 按钮（通过坐标区分），或匹配 Confirm / Complete the security check 等按钮
+    """
+    candidates = [
         '[role="dialog"] button:has-text("Renew")',
         '[role="dialog"] button:has-text("Confirm")',
         '[role="dialog"] button:has-text("Continue")',
@@ -1017,18 +1046,122 @@ def handle_post_click_flow(page, before_status):
         '[role="dialog"] button[type="submit"]',
         '.modal button:has-text("Renew")',
         '.modal button:has-text("Confirm")',
+        'button:has-text("Complete the security check")',
+        'button:has-text("Confirm")',
+        'button:has-text("Yes")',
+        'button:has-text("Renew Server")',
+        'button:has-text("Renew now")',
     ]
 
-    confirm_btn = first_visible(page, modal_confirm_selectors)
-    if confirm_btn:
-        log("🪟 检测到续期确认弹窗，正在处理弹窗内安全验证...")
-        wait_and_solve_turnstile(page, confirm_btn, timeout_sec=45)
-        confirm_btn_after = first_visible(page, modal_confirm_selectors) or confirm_btn
-        trigger_click_all_ways(page, confirm_btn_after)
-    else:
-        click_turnstile_box(page, attempt=2)
+    btn = first_visible(page, candidates)
+    if btn:
+        return btn
 
-    return wait_for_renewal_result(page, before_status, timeout_sec=35)
+    # 检查页面上是否有第二个可见的 "Renew" 按钮（例如弹窗中的 Renew 按钮，其坐标通常在屏幕中央而非右下角）
+    try:
+        renew_btns = page.locator('button:has-text("Renew"), [role="button"]:has-text("Renew")')
+        count = renew_btns.count()
+        if count >= 2:
+            for i in range(count):
+                item = renew_btns.nth(i)
+                if item.is_visible():
+                    box = item.bounding_box(timeout=1000)
+                    if box and initial_renew_box:
+                        # 如果与初始右下角按钮的坐标距离超过 50px，说明是新弹出的确认按钮
+                        if abs(box["x"] - initial_renew_box["x"]) > 50 or abs(box["y"] - initial_renew_box["y"]) > 50:
+                            return item
+            return renew_btns.last
+    except Exception:
+        pass
+
+    return None
+
+
+def handle_post_click_flow(page, before_status, initial_renew_box=None, api_messages=None):
+    """
+    处理点击续期按钮后的完整动态流程：
+    1. 高频监控 Toast / 弹窗 / API 响应
+    2. 识别任何形式的二次弹窗或内嵌 Turnstile 验证框并自动解锁点击
+    3. 如果第一下点击未触发任何弹窗或网络响应，自动使用 JS click 补点一次
+    """
+    start = time.time()
+    handled_modal = False
+    retried_initial_click = False
+
+    while time.time() - start < 38:
+        elapsed = time.time() - start
+
+        # 1. 检查实时 Toast 或 Alert 提示
+        banner = get_login_error_banner(page)
+        if banner:
+            log(f"💬 捕获到页面提示: {banner}")
+            if is_renew_limit_reached(banner):
+                return False, before_status, banner
+
+        # 2. 检查 API 消息是否已经包含限制提示
+        if api_messages:
+            joined_api = " | ".join(api_messages)
+            if is_renew_limit_reached(joined_api):
+                return False, before_status, joined_api
+
+        # 3. 检查是否已经续期成功
+        after_now = get_renewal_text(page)
+        try:
+            body_now = page.locator("body").inner_text(timeout=2000)
+        except Exception:
+            body_now = ""
+
+        if renewal_succeeded(before_status, after_now, body_now, api_messages):
+            return True, after_now, None
+
+        if is_renew_limit_reached(body_now):
+            return False, before_status, "页面提示未到可续期时间"
+
+        # 4. 查找是否弹出了二次确认按钮或验证框
+        confirm_btn = find_secondary_confirm_button(page, initial_renew_box)
+        if confirm_btn and not handled_modal:
+            handled_modal = True
+            try:
+                btn_txt = (confirm_btn.inner_text(timeout=1000) or "").strip()
+            except Exception:
+                btn_txt = "Confirm"
+            log(f"🪟 检测到二次确认/验证按钮 [{btn_txt}]，正在处理安全验证与确认点击...")
+            inspect_renew_elements(page)
+
+            wait_and_solve_turnstile(page, confirm_btn, timeout_sec=35)
+            confirm_btn_after = find_secondary_confirm_button(page, initial_renew_box) or confirm_btn
+            trigger_click_all_ways(page, confirm_btn_after)
+            time.sleep(2.0)
+            continue
+
+        # 5. 如果经过 4 秒既没有弹窗，也没有 API 响应，打印当前页面按钮诊断并用 JS 原生点击重试一次
+        if not retried_initial_click and not handled_modal and elapsed >= 4.0:
+            retried_initial_click = True
+            log("🔍 首次点击后未检测到状态变化，正在诊断页面元素并尝试二次触发...")
+            inspect_renew_elements(page)
+
+            # 尝试触发可能直接出现在页面上的 Turnstile 框
+            click_turnstile_box(page, attempt=2)
+
+            btn_again = find_right_panel_renew_button(page)
+            if btn_again:
+                try:
+                    btn_again.evaluate("el => el.click()")
+                except Exception:
+                    pass
+
+        # 6. 在等待的后半段定期刷新一下面板状态（部分面板后端续期成功但前端 React 状态未自动重拉）
+        if int(elapsed) == 22:
+            log("🔄 正在刷新服务器面板以同步最新到期天数...")
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=25000)
+                time.sleep(3.0)
+            except Exception:
+                pass
+
+        time.sleep(1.0)
+
+    return False, get_renewal_text(page), None
 
 
 def resolve_headless():
@@ -1051,6 +1184,7 @@ def run_attempt(use_proxy):
 
     user_data_dir = tempfile.mkdtemp(prefix="hostship_profile_")
     page = None
+    api_messages = []
 
     try:
         with sync_playwright() as p:
@@ -1083,12 +1217,31 @@ def run_attempt(use_proxy):
             def on_response(response):
                 try:
                     url = response.url
-                    if (
-                        "host-ship.com" in url
-                        and response.request.method in ("POST", "PUT", "PATCH")
-                        and not any(ext in url for ext in (".js", ".css", ".png", ".woff"))
-                    ):
-                        log(f"📡 网络响应 [{response.request.method}] HTTP {response.status} -> {url} | ")
+                    method = response.request.method
+                    if "host-ship.com" not in url:
+                        return
+                    if any(ext in url for ext in (".js", ".css", ".png", ".jpg", ".svg", ".woff", ".ico")):
+                        return
+
+                    # 记录所有 POST/PUT/PATCH 请求，以及包含 renew / server 的 API 响应
+                    is_action_req = method in ("POST", "PUT", "PATCH", "DELETE")
+                    is_renew_req = any(k in url.lower() for k in ("renew", "extend", "api/client/servers"))
+
+                    if is_action_req or is_renew_req:
+                        body_preview = ""
+                        if "cdn-cgi" not in url:
+                            try:
+                                raw_txt = response.text()
+                                if raw_txt:
+                                    clean_txt = re.sub(r"\s+", " ", raw_txt).strip()
+                                    body_preview = clean_txt[:220]
+                                    api_messages.append(clean_txt[:300])
+                            except Exception:
+                                pass
+                        log(
+                            f"📡 网络响应 [{method}] HTTP {response.status} -> {url}"
+                            + (f" | {body_preview}" if body_preview else " |")
+                        )
                 except Exception:
                     pass
 
@@ -1108,7 +1261,7 @@ def run_attempt(use_proxy):
 
             if days is not None and days >= 14 and not MANUAL_RUN:
                 log(f"⏳ 剩余有效期 {days} 天（需低于 14 天才可续期），本次仅检查")
-                msg = build_check_message(before_status, ip, use_proxy)
+                msg = build_check_message(before_status, ip, use_proxy, "未到续期时间（需低于 14 天）")
                 tg(msg)
                 context.close()
                 return True, None
@@ -1124,21 +1277,52 @@ def run_attempt(use_proxy):
                 save_debug_screenshot(page, "hostship_no_renew_btn")
                 raise RuntimeError("未能在面板中找到续期 (Renew) 按钮")
 
-            if renew_btn.is_disabled(timeout=2000):
-                if days is not None and days >= 14:
-                    log("ℹ️ 续期按钮当前处于禁用状态（未到可续期时间）")
-                    msg = build_check_message(before_status, ip, use_proxy)
-                    tg(msg)
-                    context.close()
-                    return True, None
+            # 打印 Renew 按钮的详细状态（坐标、是否禁用、样式）
+            inspect_renew_elements(page)
 
-            log("🖱️ 正在点击续期按钮...")
+            if is_element_pseudo_disabled(renew_btn):
+                log(f"ℹ️ 续期按钮当前处于禁用/不可点击状态（当前剩余：{before_status}，尚未进入可续期窗口）")
+                msg = build_check_message(
+                    before_status,
+                    ip,
+                    use_proxy,
+                    reason="续期按钮当前未开放（需等待剩余天数进一步减少）",
+                )
+                tg(msg)
+                context.close()
+                return True, None
+
+            initial_box = None
+            try:
+                initial_box = renew_btn.bounding_box(timeout=1500)
+            except Exception:
+                pass
+
+            api_messages.clear()
+            log("🖱️ 正在滚动并点击续期按钮...")
             trigger_click_all_ways(page, renew_btn)
 
-            ok, after_status = handle_post_click_flow(page, before_status)
+            ok, after_status, limit_reason = handle_post_click_flow(
+                page,
+                before_status,
+                initial_renew_box=initial_box,
+                api_messages=api_messages,
+            )
             if ok:
                 log(f"🎉 续期成功！状态更新为：{after_status}")
                 msg = build_success_message(before_status, after_status, ip, use_proxy)
+                tg(msg)
+                context.close()
+                return True, None
+
+            if limit_reason:
+                log(f"ℹ️ 面板提示暂未达到可续期条件: {limit_reason}")
+                msg = build_check_message(
+                    before_status,
+                    ip,
+                    use_proxy,
+                    reason=f"暂不可续期 ({limit_reason[:80]})",
+                )
                 tg(msg)
                 context.close()
                 return True, None
